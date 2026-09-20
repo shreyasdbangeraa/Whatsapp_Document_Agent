@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
+from app.whatsapp import send_text_message
 
 from app.config import WHATSAPP_VERIFY_TOKEN
 
@@ -63,6 +64,12 @@ async def receive_webhook(request: Request):
         if message_type == "text":
             text = message["text"]["body"]
             print("Message:", text)
+
+            send_text_message(
+    to=sender,
+    message="👋 Hello! Your AI Document Agent received your message."
+)
+            
 
         print("=" * 60)
 
