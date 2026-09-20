@@ -22,3 +22,12 @@ if not SUPABASE_URL:
 
 if not SUPABASE_KEY:
     raise ValueError("SUPABASE_KEY is missing from .env")
+
+if not WHATSAPP_ACCESS_TOKEN:
+    raise ValueError("WHATSAPP_ACCESS_TOKEN is missing from .env")
+
+if not WHATSAPP_PHONE_NUMBER_ID:
+    raise ValueError("WHATSAPP_PHONE_NUMBER_ID is missing from .env")
+
+if not WHATSAPP_VERIFY_TOKEN:
+    raise ValueError("WHATSAPP_VERIFY_TOKEN is missing from .env")

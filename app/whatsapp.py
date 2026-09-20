@@ -29,16 +29,22 @@ def send_text_message(to: str, message: str):
         }
     }
 
-    response = httpx.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=30
-    )
+    try:
+        response = httpx.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
 
-    print("Status:", response.status_code)
-    print("Response:", response.text)
+        print(f"📤 WhatsApp API Send Status: {response.status_code}", flush=True)
+        print(f"📤 WhatsApp API Send Response: {response.text}", flush=True)
 
-    response.raise_for_status()
-
-    return response.json()
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as e:
+        print(f"❌ WhatsApp API HTTP Error: {e.response.status_code} - {e.response.text}", flush=True)
+        raise
+    except Exception as e:
+        print(f"❌ Error sending WhatsApp message: {e}", flush=True)
+        raise
