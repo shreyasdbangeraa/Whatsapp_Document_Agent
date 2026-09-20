@@ -127,27 +127,53 @@ GUIDELINES FOR YOUR RESPONSES:
 
   const fullPrompt = `${systemPrompt}\n\nDOCUMENT CONTEXT:\n${context ? context : "No matching document context found."}\n\nUSER MESSAGE:\n${question}\n\nASSISTANT:`;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [{ text: fullPrompt }]
-        }
-      ]
-    })
-  });
+  const candidateModels = [
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash"
+  ];
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Gemini generateContent error: ${res.status} ${errText}`);
+  let lastError: any = null;
+
+  for (const model of candidateModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [{ text: fullPrompt }]
+            }
+          ]
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        if (answer) {
+          console.log(`✅ Generated answer using model: ${model}`);
+          return answer;
+        }
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
+        lastError = new Error(`Model ${model} error: ${res.status}`);
+      }
+    } catch (err) {
+      console.warn(`⚠️ Model ${model} fetch exception:`, err);
+      lastError = err;
+    }
   }
 
-  const data = await res.json();
-  const answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-  return answer;
+  if (lastError) {
+    throw lastError;
+  }
+
+  return "I'm having trouble processing that right now. Please try again in a moment!";
 }
 
 /**
@@ -222,44 +248,50 @@ async function handleSingleMessage(message: any, contacts: any[]) {
 
   // Perform RAG query
   try {
-    console.log(`🔍 Generating embedding for: "${text}"...`);
-    const embedding = await createEmbedding(text);
-
-    console.log("🔍 Searching document chunks in Supabase pgvector...");
     let chunks: ChunkResult[] = [];
+    try {
+      console.log(`🔍 Generating embedding for: "${text}"...`);
+      const embedding = await createEmbedding(text);
 
-    // 1. Search by user DB ID
-    if (userDbId) {
-      const { data, error } = await supabase.rpc("match_document_chunks", {
-        query_embedding: embedding,
-        match_user_id: userDbId,
-        match_count: 5
-      });
-      if (!error && data && data.length > 0) chunks = data;
+      if (embedding && embedding.length > 0) {
+        console.log("🔍 Searching document chunks in Supabase pgvector...");
+
+        // 1. Search by user DB ID
+        if (userDbId) {
+          const { data, error } = await supabase.rpc("match_document_chunks", {
+            query_embedding: embedding,
+            match_user_id: userDbId,
+            match_count: 5
+          });
+          if (!error && data && data.length > 0) chunks = data;
+        }
+
+        // 2. Search by sender phone number
+        if (chunks.length === 0) {
+          const { data, error } = await supabase.rpc("match_document_chunks", {
+            query_embedding: embedding,
+            match_user_id: sender,
+            match_count: 5
+          });
+          if (!error && data && data.length > 0) chunks = data;
+        }
+
+        // 3. Fallback to test_user_001 where demo PDF chunks are stored
+        if (chunks.length === 0) {
+          console.log("Falling back to test_user_001 chunks...");
+          const { data, error } = await supabase.rpc("match_document_chunks", {
+            query_embedding: embedding,
+            match_user_id: "test_user_001",
+            match_count: 5
+          });
+          if (!error && data && data.length > 0) chunks = data;
+        }
+      }
+    } catch (embedErr) {
+      console.warn("⚠️ Warning: vector search failed, falling back to general answer:", embedErr);
     }
 
-    // 2. Search by sender phone number
-    if (chunks.length === 0) {
-      const { data, error } = await supabase.rpc("match_document_chunks", {
-        query_embedding: embedding,
-        match_user_id: sender,
-        match_count: 5
-      });
-      if (!error && data && data.length > 0) chunks = data;
-    }
-
-    // 3. Fallback to test_user_001 where demo PDF chunks are stored
-    if (chunks.length === 0) {
-      console.log("Falling back to test_user_001 chunks...");
-      const { data, error } = await supabase.rpc("match_document_chunks", {
-        query_embedding: embedding,
-        match_user_id: "test_user_001",
-        match_count: 5
-      });
-      if (!error && data && data.length > 0) chunks = data;
-    }
-
-    console.log(`Retrieved ${chunks.length} chunks. Generating smart answer with Gemini 2.5 Flash...`);
+    console.log(`Retrieved ${chunks.length} chunks. Generating smart answer with Gemini...`);
     const answer = await generateAnswer(text, chunks, contactName);
 
     console.log(`Answer generated. Delivering to WhatsApp chat ${sender}...`);

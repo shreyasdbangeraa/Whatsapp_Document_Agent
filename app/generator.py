@@ -5,12 +5,12 @@ from app.config import GEMINI_API_KEY
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-MODEL = "gemini-2.5-flash"
+MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
 
 
 def generate_answer(question: str, search_results: list, user_name: str = "there") -> str:
     """
-    Generate an intelligent, conversational response.
+    Generate an intelligent, conversational response with multi-model fallback.
     - Cites exact document pages ONLY when answering from the document context.
     - Speaks naturally like a friendly AI for greetings, casual chat, and general queries without citing sources.
     """
@@ -63,9 +63,19 @@ USER MESSAGE:
 
 ASSISTANT:"""
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=full_prompt
-    )
+    last_error = None
+    for model_name in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=full_prompt
+            )
+            if response.text and response.text.strip():
+                return response.text.strip()
+        except Exception as e:
+            last_error = e
+            continue
 
-    return response.text.strip()
+    if last_error:
+        raise last_error
+    return "I'm having trouble processing that right now. Please try again!"
