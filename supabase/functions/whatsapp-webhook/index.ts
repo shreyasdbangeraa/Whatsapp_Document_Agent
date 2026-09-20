@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { extractText } from "npm:unpdf@latest";
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
 const WHATSAPP_ACCESS_TOKEN = Deno.env.get("WHATSAPP_ACCESS_TOKEN") || "";
@@ -407,6 +408,225 @@ async function createEmbedding(text: string): Promise<number[]> {
 }
 
 /**
+ * Convert base64 string to Uint8Array
+ */
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Clean unnecessary whitespace from document text
+ */
+function cleanDocumentText(text: string): string {
+  if (!text) return "";
+  return text
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .join("\n");
+}
+
+/**
+ * Split text into overlapping chunks
+ */
+function createTextChunks(text: string, chunkSize: number = 800, overlap: number = 150): string[] {
+  if (!text || !text.trim()) return [];
+  const chunks: string[] = [];
+  let start = 0;
+  const len = text.length;
+
+  while (start < len) {
+    const end = Math.min(start + chunkSize, len);
+    const chunk = text.slice(start, end).trim();
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    if (end >= len) break;
+    start += chunkSize - overlap;
+  }
+  return chunks;
+}
+
+/**
+ * Extract all pages from a document (PDF).
+ * Uses unpdf as the primary fast extractor; falls back to Gemini multimodal OCR if unpdf
+ * extracts zero/sparse text (e.g. scanned image PDF or non-standard encoding).
+ */
+async function extractDocumentPages(
+  uint8: Uint8Array,
+  base64: string,
+  mimeType: string,
+  debugLog?: (s: string) => void
+): Promise<Array<{ page_number: number; text: string }>> {
+  const pages: Array<{ page_number: number; text: string }> = [];
+
+  // Step A: Fast serverless extraction via unpdf
+  try {
+    debugLog?.("Attempting PDF text extraction via unpdf...");
+    console.log("📄 Extracting text via unpdf...");
+    const { totalPages, text } = await extractText(uint8, { mergePages: false });
+    console.log(`📄 unpdf extracted totalPages=${totalPages}`);
+    debugLog?.(`unpdf extracted totalPages=${totalPages}`);
+
+    if (Array.isArray(text) && text.length > 0) {
+      for (let i = 0; i < text.length; i++) {
+        const cleaned = cleanDocumentText(text[i]);
+        if (cleaned) {
+          pages.push({
+            page_number: i + 1,
+            text: cleaned
+          });
+        }
+      }
+    } else if (typeof text === "string" && text.trim().length > 0) {
+      const cleaned = cleanDocumentText(text);
+      if (cleaned) {
+        pages.push({ page_number: 1, text: cleaned });
+      }
+    }
+  } catch (unpdfErr) {
+    console.warn("⚠️ unpdf extraction failed:", unpdfErr);
+    debugLog?.("⚠️ unpdf extraction failed: " + String(unpdfErr));
+  }
+
+  // If unpdf successfully extracted pages with text, return them!
+  const totalChars = pages.reduce((acc, p) => acc + p.text.length, 0);
+  if (pages.length > 0 && totalChars > 50) {
+    console.log(`✅ Extracted ${pages.length} pages (${totalChars} chars) with unpdf`);
+    debugLog?.(`✅ Extracted ${pages.length} pages (${totalChars} chars) with unpdf`);
+    return pages;
+  }
+
+  // Step B: Fallback to Gemini Multimodal OCR (for scanned PDFs, handwritten notes, or images)
+  console.log("ℹ️ Text is sparse or unpdf empty. Triggering Gemini Multimodal OCR fallback...");
+  debugLog?.("Triggering Gemini Multimodal OCR fallback for document...");
+
+  const candidateModels = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash"
+  ];
+
+  const ocrPrompt = `You are a document transcription and OCR engine.
+Read this entire document and extract all the text page by page.
+Output a strict JSON array of objects with the following format:
+[
+  { "page_number": 1, "text": "transcribed text of page 1..." },
+  { "page_number": 2, "text": "transcribed text of page 2..." }
+]
+Do not omit any pages. Include all text, headers, and bullet points. Output ONLY valid JSON, without extra commentary or markdown backticks.`;
+
+  for (const model of candidateModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: mimeType,
+                    data: base64
+                  }
+                },
+                { text: ocrPrompt }
+              ]
+            }
+          ],
+          generationConfig: {
+            responseMimeType: "application/json"
+          }
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        if (jsonText) {
+          const parsed = JSON.parse(jsonText);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const ocrPages = parsed
+              .filter((p: any) => p && p.text)
+              .map((p: any, idx: number) => ({
+                page_number: Number(p.page_number) || (idx + 1),
+                text: cleanDocumentText(String(p.text))
+              }))
+              .filter((p: any) => p.text.length > 0);
+
+            if (ocrPages.length > 0) {
+              console.log(`✅ Gemini OCR extracted ${ocrPages.length} pages using model ${model}`);
+              debugLog?.(`✅ Gemini OCR extracted ${ocrPages.length} pages using model ${model}`);
+              return ocrPages;
+            }
+          }
+        }
+      }
+    } catch (ocrErr) {
+      console.warn(`Gemini OCR model ${model} error:`, ocrErr);
+      debugLog?.(`Gemini OCR model ${model} error: ` + String(ocrErr));
+    }
+  }
+
+  return pages;
+}
+
+/**
+ * Generate 768-dimensional embeddings for multiple texts using batchEmbedContents
+ * with individual createEmbedding fallback.
+ */
+async function batchCreateEmbeddings(texts: string[], debugLog?: (s: string) => void): Promise<number[][]> {
+  if (texts.length === 0) return [];
+
+  // Try Gemini batchEmbedContents API
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key=${GEMINI_API_KEY}`;
+    const requests = texts.map(t => ({
+      model: "models/gemini-embedding-001",
+      content: { parts: [{ text: t }] },
+      outputDimensionality: 768
+    }));
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data.embeddings && Array.isArray(data.embeddings)) {
+        return data.embeddings.map((e: any) => e.values || []);
+      }
+    } else {
+      const errText = await res.text();
+      console.warn(`⚠️ batchEmbedContents returned ${res.status}: ${errText}. Falling back to sequential embeddings.`);
+      debugLog?.(`batchEmbedContents status ${res.status}, falling back.`);
+    }
+  } catch (batchErr) {
+    console.warn("⚠️ batchEmbedContents exception:", batchErr);
+    debugLog?.("batchEmbedContents exception: " + String(batchErr));
+  }
+
+  // Fallback: embed individually
+  const results: number[][] = [];
+  for (const text of texts) {
+    const emb = await createEmbedding(text);
+    results.push(emb);
+  }
+  return results;
+}
+
+/**
  * Generate text answer using Gemini with multi-turn conversation memory and multi-model fallback
  */
 async function generateAnswer(
@@ -794,36 +1014,127 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
     const filename = message.document?.filename || "document.pdf";
     const docMime = message.document?.mime_type || "application/pdf";
     const caption = message.document?.caption || "";
-    console.log(`📄 Document received: ${filename} (ID=${mediaId}, MIME=${docMime}, Caption="${caption}")`);
+    const directBase64 = message.document?.base64 || "";
+    console.log(`📄 Document received: ${filename} (ID=${mediaId || "direct"}, MIME=${docMime}, Caption="${caption}")`);
 
-    if (!mediaId) {
+    if (!mediaId && !directBase64) {
       await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the document. Please try sending it again.", debugLog);
       return;
     }
 
     try {
-      await sendWhatsAppMessage(sender, `📄 Processing *${filename}* with AI, please wait a moment...`, debugLog);
-      const { base64, mimeType } = await fetchWhatsAppMediaAsBase64(mediaId);
+      await sendWhatsAppMessage(sender, `📄 Processing *${filename}* with AI and indexing all pages, please wait a moment...`, debugLog);
+      const { base64, mimeType } = directBase64
+        ? { base64: directBase64, mimeType: docMime }
+        : await fetchWhatsAppMediaAsBase64(mediaId);
+      const uint8 = base64ToUint8Array(base64);
 
       // Save document record in Supabase
+      let docId: string | null = null;
       try {
-        await supabase.from("documents").insert({
-          user_id: userDbId || sender,
-          filename: filename
-        });
+        const { data: docRecord, error: docDbErr } = await supabase
+          .from("documents")
+          .insert({
+            user_id: sender,
+            filename: filename
+          })
+          .select("id")
+          .single();
+
+        if (!docDbErr && docRecord) {
+          docId = docRecord.id;
+          console.log(`📄 Created document record ID: ${docId}`);
+          debugLog?.(`Created document record ID: ${docId}`);
+        } else if (docDbErr) {
+          console.warn("Could not retrieve document ID after insert:", docDbErr);
+          debugLog?.("Could not retrieve document ID: " + JSON.stringify(docDbErr));
+        }
       } catch (dbErr) {
         console.warn("Could not save document record:", dbErr);
       }
 
-      const answer = await generateMultimodalAnswer(caption, base64, mimeType, contactName, true, debugLog);
-      await sendWhatsAppMessage(sender, answer, debugLog);
-      console.log(`✅ Document analysis sent to ${sender}`);
+      // Extract all pages from document
+      console.log(`📄 Extracting pages from ${filename}...`);
+      debugLog?.(`Extracting pages from ${filename}...`);
+      const pages = await extractDocumentPages(uint8, base64, mimeType, debugLog);
+      console.log(`📄 Total pages extracted: ${pages.length}`);
+      debugLog?.(`Total pages extracted: ${pages.length}`);
+
+      // Prepare chunks across all pages
+      const allChunks: Array<{
+        page_number: number;
+        chunk_index: number;
+        content: string;
+      }> = [];
+
+      let globalChunkIndex = 0;
+      for (const page of pages) {
+        const chunks = createTextChunks(page.text, 800, 150);
+        for (const chunk of chunks) {
+          globalChunkIndex++;
+          allChunks.push({
+            page_number: page.page_number,
+            chunk_index: globalChunkIndex,
+            content: chunk
+          });
+        }
+      }
+
+      console.log(`📄 Total chunks prepared across ${pages.length} pages: ${allChunks.length}`);
+      debugLog?.(`Total chunks prepared: ${allChunks.length}`);
+
+      // Generate embeddings and store chunks into document_chunks in batches of 50
+      let storedChunkCount = 0;
+      const BATCH_SIZE = 50;
+      for (let start = 0; start < allChunks.length; start += BATCH_SIZE) {
+        const batch = allChunks.slice(start, start + BATCH_SIZE);
+        const batchTexts = batch.map(b => b.content);
+        console.log(`🧠 Embedding batch ${start + 1} to ${start + batch.length} of ${allChunks.length}...`);
+        debugLog?.(`Embedding batch ${start + 1} to ${start + batch.length}...`);
+
+        const embeddings = await batchCreateEmbeddings(batchTexts, debugLog);
+
+        const rows = batch.map((item, idx) => ({
+          document_id: docId,
+          user_id: sender,
+          chunk_index: item.chunk_index,
+          content: item.content,
+          page_number: item.page_number,
+          embedding: embeddings[idx] && embeddings[idx].length > 0 ? embeddings[idx] : null
+        }));
+
+        const { error: chunkInsertErr } = await supabase
+          .from("document_chunks")
+          .insert(rows);
+
+        if (chunkInsertErr) {
+          console.error("❌ Error inserting chunks into document_chunks:", chunkInsertErr);
+          debugLog?.("❌ Error inserting chunks: " + JSON.stringify(chunkInsertErr));
+        } else {
+          storedChunkCount += rows.length;
+          console.log(`✅ Stored ${storedChunkCount}/${allChunks.length} chunks in document_chunks table!`);
+          debugLog?.(`Stored ${storedChunkCount}/${allChunks.length} chunks in document_chunks.`);
+        }
+      }
+
+      // Generate initial multimodal analysis / answer caption
+      const initialAnalysis = await generateMultimodalAnswer(caption, base64, mimeType, contactName, true, debugLog);
+
+      let finalReply = "";
+      if (caption && caption.trim()) {
+        finalReply = `✅ *Document Indexed (${pages.length} pages, ${storedChunkCount} knowledge chunks)*\n\n${initialAnalysis}`;
+      } else {
+        finalReply = `📄 *Document Successfully Indexed!*\n\n• *File:* ${filename}\n• *Total Pages Indexed:* ${pages.length}\n• *Knowledge Chunks Stored:* ${storedChunkCount}\n\n${initialAnalysis}\n\n💡 _All pages are now stored in memory! You can ask me any specific question about ${filename} anytime._`;
+      }
+
+      await sendWhatsAppMessage(sender, finalReply, debugLog);
+      console.log(`✅ Document indexing confirmation sent to ${sender}`);
 
       // Save turn to conversation history
       const userSummary = caption
         ? `[Uploaded document: ${filename} with question: "${caption}"]`
-        : `[Uploaded document: ${filename}]`;
-      await saveConversationTurn(userDbId || sender, sender, userSummary, answer, debugLog);
+        : `[Uploaded document: ${filename} (${pages.length} pages indexed)]`;
+      await saveConversationTurn(userDbId || sender, sender, userSummary, finalReply, debugLog);
     } catch (docErr) {
       console.error("❌ Error processing document:", docErr);
       debugLog?.("❌ Error processing document: " + String(docErr));
@@ -957,24 +1268,40 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
         if (embedding && embedding.length > 0) {
           console.log("🔍 Searching document chunks in Supabase pgvector...");
 
-          // Search by user DB ID
-          if (userDbId) {
-            const { data, error } = await supabase.rpc("match_document_chunks", {
+          // 1. Search by sender phone number
+          const { data: senderChunks, error: sErr } = await supabase.rpc("match_document_chunks", {
+            query_embedding: embedding,
+            match_user_id: sender,
+            match_count: 5
+          });
+          if (!sErr && senderChunks && senderChunks.length > 0) chunks = senderChunks;
+
+          // 2. Fallback to user DB ID if no chunks found by sender
+          if (chunks.length === 0 && userDbId && userDbId !== sender) {
+            const { data: dbChunks, error: dbErr } = await supabase.rpc("match_document_chunks", {
               query_embedding: embedding,
               match_user_id: userDbId,
               match_count: 5
             });
-            if (!error && data && data.length > 0) chunks = data;
+            if (!dbErr && dbChunks && dbChunks.length > 0) chunks = dbChunks;
           }
-
-          // Search by sender phone number
-          if (chunks.length === 0) {
-            const { data, error } = await supabase.rpc("match_document_chunks", {
-              query_embedding: embedding,
-              match_user_id: sender,
-              match_count: 5
-            });
-            if (!error && data && data.length > 0) chunks = data;
+          // Resolve filenames for chunks so citations display the exact file name
+          if (chunks.length > 0) {
+            const docIds = [...new Set(chunks.map(c => c.document_id).filter(Boolean))];
+            if (docIds.length > 0) {
+              const { data: docs } = await supabase
+                .from("documents")
+                .select("id, filename")
+                .in("id", docIds);
+              if (docs && docs.length > 0) {
+                const docMap = new Map(docs.map((d: any) => [d.id, d.filename]));
+                for (const c of chunks) {
+                  if (c.document_id && docMap.has(c.document_id)) {
+                    c.filename = docMap.get(c.document_id);
+                  }
+                }
+              }
+            }
           }
         }
       } catch (embedErr) {
