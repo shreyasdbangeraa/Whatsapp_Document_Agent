@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 
-from config import WHATSAPP_VERIFY_TOKEN
+from app.config import WHATSAPP_VERIFY_TOKEN
 
 
 app = FastAPI()
