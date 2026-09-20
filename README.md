@@ -43,11 +43,12 @@ An AI-powered document intelligence agent built for WhatsApp using **Retrieval-A
 
 ## 🛠️ Tech Stack
 
-- **Language:** Python 3.10+
-- **LLM & Embeddings:** Google GenAI SDK (`google-genai`), Gemini 2.5 Flash, Gemini Embedding 001
+- **Language & Runtime:** Python 3.10+ (Local ingestion), TypeScript & Deno (Supabase Edge Functions)
+- **LLM & Embeddings:** Google GenAI (Gemini 2.5 Flash, Gemini Embedding 001)
 - **Database & Vector Store:** Supabase (PostgreSQL with `pgvector`)
+- **Serverless Webhook Engine:** Supabase Edge Functions (Always-on, globally distributed)
 - **PDF Processing:** PyMuPDF (`pymupdf`)
-- **Backend & APIs:** FastAPI, Uvicorn, Python-dotenv
+- **Messaging:** Meta WhatsApp Cloud API (Graph API v25.0)
 
 ---
 
@@ -244,7 +245,7 @@ An algorithm is a well-defined computational procedure that takes some value, or
 
 ## 🗺️ Roadmap
 
-- [ ] FastAPI webhook endpoints for WhatsApp messaging (Twilio / Meta WhatsApp Cloud API)
+- [x] WhatsApp Cloud API webhook integration (Serverless via Supabase Edge Functions)
 - [ ] Direct PDF uploads via WhatsApp chat
 - [ ] Conversation history & session memory per user
 - [ ] Support for multiple file types (DOCX, TXT, CSV)
