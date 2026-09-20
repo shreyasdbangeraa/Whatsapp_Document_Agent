@@ -1226,6 +1226,182 @@ async function processDueReminders(debugLog?: (s: string) => void): Promise<{ pr
 }
 
 /**
+ * Log all incoming messages into inbox_messages table
+ */
+async function logIncomingMessage(
+  senderPhone: string,
+  senderName: string,
+  messageId: string,
+  messageType: string,
+  content: string,
+  debugLog?: (s: string) => void
+) {
+  try {
+    const { error } = await supabase.from("inbox_messages").insert({
+      sender_phone: senderPhone,
+      sender_name: senderName || "Unknown Contact",
+      message_id: messageId,
+      message_type: messageType,
+      content: content,
+      is_read_by_owner: false
+    });
+    if (!error) {
+      console.log(`📥 Logged inbox message from ${senderName} (${senderPhone}): "${content?.slice(0, 50)}"`);
+      debugLog?.(`📥 Logged inbox message from ${senderName} (${senderPhone})`);
+    } else {
+      console.warn("Could not log inbox message:", error);
+    }
+  } catch (err) {
+    console.warn("Exception logging inbox message:", err);
+  }
+}
+
+/**
+ * Parse and resolve inquiries about messages sent by other contacts (e.g. Gagan)
+ */
+async function resolveInboxQuery(
+  text: string,
+  contactName: string,
+  senderPhone?: string,
+  debugLog?: (s: string) => void
+): Promise<string | null> {
+  const lower = text.toLowerCase();
+  const keywords = [
+    "what did", "what message did", "did anyone", "did someone", "check messages",
+    "check inbox", "unread messages", "any messages", "who messaged", "who sent",
+    "without opening", "inbox", "what has", "what was sent", "received from",
+    "message from", "messages from"
+  ];
+
+  const hasKw = keywords.some(k => lower.includes(k));
+  if (!hasKw) return null;
+
+  // Extract contact name if specified
+  let targetName: string | null = null;
+
+  const regexPatterns = [
+    /(?:what\s+(?:did|has)\s+)([a-zA-Z0-9_\s]+?)\s+(?:send|sent|say|said|write|text|message)/i,
+    /(?:what\s+message\s+did\s+)([a-zA-Z0-9_\s]+?)\s+(?:send|sent|say|write|text)/i,
+    /(?:messages?\s+from|check\s+messages?\s+from|check)\s+([a-zA-Z0-9_\s]+?)(?:\?|$|\s+without|\s+send|\s+sent|\s+messages)/i,
+    /(?:did)\s+([a-zA-Z0-9_\s]+?)\s+(?:message|text|send|ping|write|say)/i
+  ];
+
+  for (const pat of regexPatterns) {
+    const m = text.match(pat);
+    if (m && m[1]) {
+      let candidate = m[1].trim();
+      candidate = candidate.replace(/\b(the|a|his|her|their|me|to)\b/gi, "").trim();
+      const forbidden = ["he", "she", "they", "anyone", "someone", "you", "i", "my", "we"];
+      if (candidate && !forbidden.includes(candidate.toLowerCase())) {
+        targetName = candidate;
+        break;
+      }
+    }
+  }
+
+  // Fallback to Gemini if regex did not extract a name
+  if (!targetName && (lower.includes("what did") || lower.includes("who sent") || lower.includes("check messages") || lower.includes("without opening"))) {
+    const candidateModels = [
+      "gemini-3.5-flash-lite",
+      "gemini-flash-lite-latest",
+      "gemini-2.5-flash"
+    ];
+
+    const prompt = `Analyze this inquiry from a user asking about incoming messages received from other people:
+"${text}"
+
+Extract the target person's name or contact if mentioned (e.g. "Gagan", "Rahul", "Priya").
+If the user is asking generally about anyone or all messages (e.g. "did anyone message me", "check my messages", "check inbox"), target_name must be null.
+
+Output strict JSON:
+{"is_inbox_query": true, "target_name": "extracted name or null"}`;
+
+    for (const model of candidateModels) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json" }
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const jsonStr = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+          if (jsonStr) {
+            const parsed = JSON.parse(jsonStr);
+            if (parsed.is_inbox_query) {
+              targetName = parsed.target_name || null;
+              break;
+            }
+          }
+        }
+      } catch (_) {
+        // continue to next model
+      }
+    }
+  }
+
+  console.log(`🕵️‍♂️ Checking inbox messages for target: ${targetName || "ALL"}...`);
+  debugLog?.(`🕵️‍♂️ Checking inbox messages for target: ${targetName || "ALL"}`);
+
+  let queryBuilder = supabase
+    .from("inbox_messages")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  // Filter out messages sent by the inquirer themselves so they don't see their own queries
+  if (senderPhone) {
+    queryBuilder = queryBuilder.neq("sender_phone", senderPhone);
+  }
+
+  if (targetName) {
+    queryBuilder = queryBuilder.or(`sender_name.ilike.%${targetName}%,sender_phone.ilike.%${targetName}%`);
+  }
+
+  const { data: messages, error } = await queryBuilder;
+
+  if (error) {
+    console.warn("Error querying inbox_messages:", error);
+    debugLog?.("Error querying inbox_messages: " + JSON.stringify(error));
+    return null;
+  }
+
+  if (!messages || messages.length === 0) {
+    if (targetName) {
+      return `📭 *Inbox Check:* No messages found from *${targetName}*.\n\nThey haven't sent any messages to this WhatsApp number yet!`;
+    }
+    return "📭 *Your Inbox is Empty!* No incoming messages have arrived from your contacts recently.";
+  }
+
+  const header = targetName
+    ? `📩 *Messages from ${messages[0].sender_name || targetName} (without opening their chat):*`
+    : `📩 *Recent Messages Received (without opening chats):*`;
+
+  const items = messages.map((m: any, idx: number) => {
+    const dateStr = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Asia/Kolkata",
+      dateStyle: "medium",
+      timeStyle: "short"
+    }).format(new Date(m.created_at));
+
+    let typeIcon = "💬 Text";
+    if (m.message_type === "audio" || m.message_type === "voice") typeIcon = "🎙️ Voice Note";
+    else if (m.message_type === "image") typeIcon = "🖼️ Photo";
+    else if (m.message_type === "document") typeIcon = "📄 Document";
+
+    const senderDisplay = targetName ? "" : ` (${m.sender_name || m.sender_phone})`;
+    return `${idx + 1}. *From:* ${m.sender_name || m.sender_phone}${senderDisplay}\n   ⏰ ${dateStr} • ${typeIcon}\n   📝 "${m.content || "[Media content]"}"`;
+  }).join("\n\n");
+
+  const reply = `${header}\n\n${items}\n\n💡 _These messages remain unread and unopened in WhatsApp!_`;
+  return reply;
+}
+
+/**
  * Lookup or create user in Supabase
  */
 async function getOrCreateUser(whatsappNumber: string, debugLog?: (s: string) => void) {
@@ -1296,6 +1472,16 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
     const caption = message.image?.caption || "";
     console.log(`🖼️ Image received: ID=${mediaId}, Caption="${caption}"`);
 
+    // Log incoming image into inbox_messages
+    await logIncomingMessage(
+      sender,
+      contactName,
+      messageId,
+      "image",
+      caption ? `[Photo]: ${caption}` : "[Photo]",
+      debugLog
+    );
+
     if (!mediaId) {
       await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the image data. Please try sending it again.", debugLog);
       return;
@@ -1331,6 +1517,16 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
     const caption = message.document?.caption || "";
     const directBase64 = message.document?.base64 || "";
     console.log(`📄 Document received: ${filename} (ID=${mediaId || "direct"}, MIME=${docMime}, Caption="${caption}")`);
+
+    // Log incoming document into inbox_messages
+    await logIncomingMessage(
+      sender,
+      contactName,
+      messageId,
+      "document",
+      caption ? `[Document: ${filename}]: ${caption}` : `[Document]: ${filename}`,
+      debugLog
+    );
 
     if (!mediaId && !directBase64) {
       await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the document. Please try sending it again.", debugLog);
@@ -1494,6 +1690,18 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
 
       console.log(`🗣️ Transcribed text from ${sender}: "${transcript}"`);
       debugLog?.(`🗣️ Transcribed text from ${sender}: "${transcript}"`);
+
+      // Log incoming voice note into inbox_messages with transcription
+      await logIncomingMessage(sender, contactName, messageId, "audio", transcript, debugLog);
+
+      // Check if user is asking what someone sent without opening their chat via voice
+      const inboxBriefing = await resolveInboxQuery(transcript, contactName, sender, debugLog);
+      if (inboxBriefing) {
+        const voiceReply = `🎙️ *Voice Note:* _"${transcript}"_\n\n${inboxBriefing}`;
+        await sendWhatsAppMessage(sender, voiceReply, debugLog);
+        await saveConversationTurn(userDbId || sender, sender, `[Voice Note]: "${transcript}"`, voiceReply, debugLog);
+        return;
+      }
 
       const lower = transcript.toLowerCase().trim();
 
@@ -1669,6 +1877,17 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
     debugLog?.(`💬 User message from ${sender}: "${text}"`);
 
     if (!text) return;
+
+    // 1. Log incoming message into inbox_messages table
+    await logIncomingMessage(sender, contactName, messageId, "text", text, debugLog);
+
+    // 2. Check if user is asking what someone sent without opening their chat
+    const inboxBriefing = await resolveInboxQuery(text, contactName, sender, debugLog);
+    if (inboxBriefing) {
+      await sendWhatsAppMessage(sender, inboxBriefing, debugLog);
+      await saveConversationTurn(userDbId || sender, sender, text, inboxBriefing, debugLog);
+      return;
+    }
 
     const lower = text.toLowerCase();
 
@@ -1915,7 +2134,7 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
   // 5. UNSUPPORTED TYPES
   await sendWhatsAppMessage(
     sender,
-    "👋 Hello! I support text questions, voice notes 🎙️, live Google search 🌐, web/YouTube summarizer 🔗, reminders & deadlines ⏰, images 🖼️, and PDF documents 📄. How can I help you today?",
+    "👋 Hello! I support text questions, voice notes 🎙️, live Google search 🌐, web/YouTube summarizer 🔗, inbox message secretary 📩, reminders & deadlines ⏰, images 🖼️, and PDF documents 📄. How can I help you today?",
     debugLog
   );
 }
