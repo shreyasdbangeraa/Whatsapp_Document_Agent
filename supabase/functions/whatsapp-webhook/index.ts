@@ -22,6 +22,33 @@ interface ChunkResult {
 interface HistoryRow {
   role: string;
   content: string;
+  seq?: number;
+}
+
+interface ReminderItem {
+  id?: string;
+  user_id: string;
+  whatsapp_number: string;
+  title: string;
+  remind_at: string;
+  status: string;
+  reminder_type: string;
+  original_text?: string;
+  created_at?: string;
+  sent_at?: string;
+}
+
+interface ParsedReminderResult {
+  is_reminder: boolean;
+  is_deadline?: boolean;
+  task_title?: string;
+  scheduled_reminders?: Array<{
+    title: string;
+    remind_at_iso: string;
+    reminder_type: string;
+    display_time: string;
+  }>;
+  confirmation_message?: string;
 }
 
 /**
@@ -53,7 +80,7 @@ function formatHistoryForGemini(
   }
 
   // Gemini requires turns to alternate, ending with the user turn we will append.
-  // Therefore, any trailing user turns in the history must be popped.
+  // Therefore, any trailing user turns in the history must be popped so history ends with 'model'.
   while (formatted.length > 0 && formatted[formatted.length - 1].role === "user") {
     formatted.pop();
   }
@@ -62,7 +89,7 @@ function formatHistoryForGemini(
 }
 
 /**
- * Fetch recent conversation history for a given WhatsApp number
+ * Fetch recent conversation history for a given WhatsApp number ordered by seq
  */
 async function getConversationHistory(
   whatsappNumber: string,
@@ -93,7 +120,7 @@ async function getConversationHistory(
 }
 
 /**
- * Save user prompt and assistant reply into conversation_history
+ * Save user prompt and assistant reply into conversation_history sequentially
  */
 async function saveConversationTurn(
   userId: string,
@@ -495,6 +522,175 @@ GUIDELINES FOR YOUR RESPONSES:
 }
 
 /**
+ * AI Time & Reminder Parser using Gemini Structured JSON
+ */
+async function parseReminderRequest(
+  text: string,
+  contactName: string,
+  debugLog?: (s: string) => void
+): Promise<ParsedReminderResult | null> {
+  const lower = text.toLowerCase();
+  const reminderKeywords = [
+    "remind", "reminder", "deadline", "due on", "due date", "submission",
+    "submit on", "don't forget", "dont forget", "alert me", "notify me"
+  ];
+  const hasKeyword = reminderKeywords.some(kw => lower.includes(kw));
+  if (!hasKeyword) return null;
+
+  const now = new Date();
+  const localTimeStr = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Kolkata",
+    dateStyle: "full",
+    timeStyle: "long"
+  }).format(now);
+
+  const prompt = `You are a precise Time & Reminder Extraction Engine for WhatsApp. The user's name is "${contactName}".
+Current User Local Time: ${localTimeStr} (Timezone: Asia/Kolkata, UTC+05:30).
+
+USER MESSAGE: "${text}"
+
+Determine if the user wants to set a reminder or announce a deadline/assignment submission.
+If NO, output: {"is_reminder": false}
+
+If YES:
+Preferred Times of Day (in Asia/Kolkata, UTC+05:30):
+- Morning: 09:00:00 (09:00 AM)
+- Afternoon: 14:00:00 (02:00 PM)
+- Evening: 18:00:00 (06:00 PM)
+- Night: 21:00:00 (09:00 PM)
+
+Is this a DEADLINE / ASSIGNMENT SUBMISSION announcement?
+(e.g., "on 25th september is my assignment submission deadline", "my project deadline is...", "assignment due on...")
+If YES (is_deadline = true):
+Assume target deadline is either the specified time or end of that day (23:59:00).
+Generate up to 5 scheduled alerts in Asia/Kolkata (+05:30) that are strictly in the future:
+1. 2 Days Before: Target Date - 2 days at 09:00:00 (reminder_type: "deadline_lead")
+2. Deadline Day Morning: Target Date at 09:00:00 (reminder_type: "deadline_day_morning")
+3. Deadline Day Afternoon: Target Date at 14:00:00 (reminder_type: "deadline_day_afternoon")
+4. Final Countdown (2 hrs before deadline): Target Deadline - 2 hours (reminder_type: "deadline_day_final")
+5. Deadline Reached: Exact deadline time (reminder_type: "deadline_end")
+
+If SINGLE REMINDER (is_deadline = false):
+(e.g. "remind me tomorrow morning to make ML notes", "remind me tomorrow evening to complete assignment", "remind me in 10 minutes to call mom"):
+Generate 1 reminder at the requested date and preferred time in ISO format with +05:30 offset.
+
+Output valid JSON only:
+{
+  "is_reminder": true,
+  "is_deadline": boolean,
+  "task_title": "clean concise task name",
+  "scheduled_reminders": [
+    {
+      "title": "string describing what this specific alert is for",
+      "remind_at_iso": "YYYY-MM-DDTHH:MM:SS+05:30",
+      "reminder_type": "single | deadline_lead | deadline_day_morning | deadline_day_afternoon | deadline_day_final | deadline_end",
+      "display_time": "human-friendly time string, e.g. Tomorrow at 9:00 AM"
+    }
+  ],
+  "confirmation_message": "Warm, beautifully formatted WhatsApp markdown confirmation message with emojis, bullet points of all scheduled times, and encouraging words."
+}`;
+
+  const candidateModels = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash"
+  ];
+
+  for (const model of candidateModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json" }
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        if (jsonText) {
+          const parsed = JSON.parse(jsonText);
+          if (parsed && parsed.is_reminder) {
+            debugLog?.(`Successfully parsed reminder using ${model}: ${JSON.stringify(parsed)}`);
+            return parsed;
+          }
+          return null;
+        }
+      }
+    } catch (e) {
+      debugLog?.(`Model ${model} reminder parser exception: ${String(e)}`);
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Dispatch due reminders across all users (triggered every minute via pg_cron / pg_net)
+ */
+async function processDueReminders(debugLog?: (s: string) => void): Promise<{ processed: number; sent: number }> {
+  const nowIso = new Date().toISOString();
+  debugLog?.(`🔔 Checking due reminders at ${nowIso}...`);
+
+  const { data: due, error } = await supabase
+    .from("reminders")
+    .select("*")
+    .eq("status", "pending")
+    .lte("remind_at", nowIso)
+    .order("remind_at", { ascending: true })
+    .limit(20);
+
+  if (error) {
+    console.error("❌ Error querying due reminders:", error);
+    debugLog?.("❌ Error querying due reminders: " + JSON.stringify(error));
+    return { processed: 0, sent: 0 };
+  }
+
+  if (!due || due.length === 0) {
+    debugLog?.("No reminders currently due.");
+    return { processed: 0, sent: 0 };
+  }
+
+  debugLog?.(`Found ${due.length} due reminders to dispatch!`);
+  let sentCount = 0;
+
+  for (const item of due) {
+    let alertMsg = "";
+    if (item.reminder_type === "deadline_lead") {
+      alertMsg = `⚠️ *UPCOMING DEADLINE IN 2 DAYS!* ⚠️\n\n📌 *Task / Deadline:* ${item.title}\n🗓️ *Status:* Due in 48 hours!\n\n💡 *Tip:* Ensure your main work is complete so you have plenty of time for final reviews! 💪`;
+    } else if (item.reminder_type === "deadline_day_morning") {
+      alertMsg = `🚨 *DEADLINE TODAY (Morning Alert)!* 🚨\n\n📌 *Task / Deadline:* ${item.title}\n⏰ *Status:* Due today!\n\n💡 *Action:* Double-check requirements, attachments, and make final preparations for submission.`;
+    } else if (item.reminder_type === "deadline_day_afternoon") {
+      alertMsg = `⏳ *MID-DAY DEADLINE REMINDER!* ⏳\n\n📌 *Task / Deadline:* ${item.title}\n⏰ *Status:* Due today!\n\nHave you completed and submitted your assignment? Avoid the last-minute portal rush! 🚀`;
+    } else if (item.reminder_type === "deadline_day_final") {
+      alertMsg = `🔥 *FINAL 2 HOURS COUNTDOWN!* 🔥\n\n📌 *Task / Deadline:* ${item.title}\n⏳ *Time Remaining:* ~2 Hours Left!\n\n🚀 *Action:* Submit your work immediately to prevent portal traffic or late submission penalties!`;
+    } else if (item.reminder_type === "deadline_end") {
+      alertMsg = `🏁 *DEADLINE TIME REACHED!* 🏁\n\n📌 *Task / Deadline:* ${item.title}\n⏰ *Status:* The submission window has now reached its deadline.\n\nMake sure your submission confirmation or receipt is safely saved! 🎓`;
+    } else {
+      alertMsg = `⏰ *SCHEDULED REMINDER ALERT!* ⏰\n\n📌 *Task:* ${item.title}\n\nThis is your scheduled reminder. Hope you're having a productive time! 💪`;
+    }
+
+    const ok = await sendWhatsAppMessage(item.whatsapp_number, alertMsg, debugLog);
+    if (ok) {
+      await supabase
+        .from("reminders")
+        .update({ status: "sent", sent_at: new Date().toISOString() })
+        .eq("id", item.id);
+      sentCount++;
+      debugLog?.(`✅ Dispatched reminder id=${item.id} to ${item.whatsapp_number}`);
+    }
+  }
+
+  return { processed: due.length, sent: sentCount };
+}
+
+/**
  * Lookup or create user in Supabase
  */
 async function getOrCreateUser(whatsappNumber: string, debugLog?: (s: string) => void) {
@@ -648,8 +844,9 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
 
     if (!text) return;
 
-    // Reset / clear conversation memory command
     const lower = text.toLowerCase();
+
+    // A. Reset / clear conversation memory command
     if (lower === "/reset" || lower === "/clear" || lower === "clear memory" || lower === "reset memory") {
       console.log(`🧹 Clearing conversation history for ${sender}...`);
       await clearConversationHistory(sender, debugLog);
@@ -661,6 +858,91 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
       return;
     }
 
+    // B. View active scheduled reminders command
+    if (lower === "/reminders" || lower === "my reminders" || lower === "view reminders" || lower === "show reminders") {
+      console.log(`📋 Fetching upcoming reminders for ${sender}...`);
+      const { data: upcoming, error: remErr } = await supabase
+        .from("reminders")
+        .select("*")
+        .eq("whatsapp_number", sender)
+        .eq("status", "pending")
+        .order("remind_at", { ascending: true });
+
+      if (remErr || !upcoming || upcoming.length === 0) {
+        await sendWhatsAppMessage(
+          sender,
+          "📋 You have no upcoming reminders scheduled right now.\n\nTo set one, simply tell me:\n• *\"Remind me tomorrow morning to make notes\"*\n• *\"On 25th September is my assignment submission deadline\"*",
+          debugLog
+        );
+      } else {
+        const listText = upcoming.map((r, i) => {
+          const dateStr = new Intl.DateTimeFormat("en-US", {
+            timeZone: "Asia/Kolkata",
+            dateStyle: "medium",
+            timeStyle: "short"
+          }).format(new Date(r.remind_at));
+          return `${i + 1}. 📌 *${r.title}*\n   ⏰ ${dateStr}`;
+        }).join("\n\n");
+
+        await sendWhatsAppMessage(
+          sender,
+          `📋 *Your Upcoming Scheduled Reminders:*\n\n${listText}\n\n💡 _Send /clearreminders to cancel upcoming reminders._`,
+          debugLog
+        );
+      }
+      return;
+    }
+
+    // C. Cancel / clear upcoming reminders command
+    if (lower === "/clearreminders" || lower === "clear reminders" || lower === "cancel reminders") {
+      console.log(`🧹 Cancelling all pending reminders for ${sender}...`);
+      await supabase
+        .from("reminders")
+        .update({ status: "cancelled" })
+        .eq("whatsapp_number", sender)
+        .eq("status", "pending");
+
+      await sendWhatsAppMessage(
+        sender,
+        "🧹 *All pending reminders cancelled!* Your scheduled alerts have been cleared.",
+        debugLog
+      );
+      return;
+    }
+
+    // D. Check for Reminder or Deadline scheduling request
+    try {
+      const reminderResult = await parseReminderRequest(text, contactName, debugLog);
+      if (
+        reminderResult &&
+        reminderResult.is_reminder &&
+        reminderResult.scheduled_reminders &&
+        reminderResult.scheduled_reminders.length > 0
+      ) {
+        console.log(`⏰ Scheduling ${reminderResult.scheduled_reminders.length} reminder(s) for ${sender}...`);
+        for (const item of reminderResult.scheduled_reminders) {
+          await supabase.from("reminders").insert({
+            user_id: userDbId || sender,
+            whatsapp_number: sender,
+            title: item.title || reminderResult.task_title || "Reminder",
+            remind_at: new Date(item.remind_at_iso).toISOString(),
+            reminder_type: item.reminder_type || "single",
+            original_text: text,
+            status: "pending"
+          });
+        }
+
+        const confirmMsg = reminderResult.confirmation_message || "✅ *Reminder Set Successfully!*";
+        await sendWhatsAppMessage(sender, confirmMsg, debugLog);
+        await saveConversationTurn(userDbId || sender, sender, text, confirmMsg, debugLog);
+        return;
+      }
+    } catch (parseErr) {
+      console.warn("⚠️ Exception parsing reminder intent:", parseErr);
+      debugLog?.("⚠️ Exception in parseReminderRequest: " + String(parseErr));
+    }
+
+    // E. Regular Conversation & Document RAG Generation
     try {
       // 1. Fetch recent conversation history
       const history = await getConversationHistory(sender, 10, debugLog);
@@ -724,7 +1006,7 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
   // 4. UNSUPPORTED TYPES
   await sendWhatsAppMessage(
     sender,
-    "👋 Hello! I currently support text questions, images (photos, diagrams, notes), and PDF documents. Send me a file or ask any question!",
+    "👋 Hello! I currently support text questions, reminders & deadlines, images (photos, diagrams, notes), and PDF documents. Send me a file or ask any question!",
     debugLog
   );
 }
@@ -734,6 +1016,19 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
  */
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
+
+  // 0. Automated Cron Trigger for Reminders (called every minute by pg_cron / pg_net)
+  if (url.searchParams.get("action") === "process-reminders") {
+    const logs: string[] = [];
+    const debugLog = (msg: string) => {
+      logs.push(`[${new Date().toISOString()}] ${msg}`);
+      console.log(msg);
+    };
+
+    console.log("⏰ CRON TRIGGER: processDueReminders invoked");
+    const result = await processDueReminders(debugLog);
+    return Response.json({ status: "processed", ...result, logs });
+  }
 
   // 1. GET: Webhook verification for Meta WhatsApp Cloud API
   if (req.method === "GET") {
@@ -754,7 +1049,7 @@ Deno.serve(async (req: Request) => {
     return new Response("Forbidden", { status: 403 });
   }
 
-  // 2. POST: Handle incoming WhatsApp webhook events
+  // 2. POST: Handle incoming WhatsApp webhook events OR cron body triggers
   if (req.method === "POST") {
     let body: any;
     try {
@@ -762,6 +1057,17 @@ Deno.serve(async (req: Request) => {
     } catch (err) {
       console.error("Invalid JSON:", err);
       return Response.json({ error: "Invalid JSON" }, { status: 400 });
+    }
+
+    // Check if body was a cron trigger from pg_net
+    if (body && body.trigger === "cron") {
+      const logs: string[] = [];
+      const debugLog = (msg: string) => {
+        logs.push(`[${new Date().toISOString()}] ${msg}`);
+        console.log(msg);
+      };
+      const result = await processDueReminders(debugLog);
+      return Response.json({ status: "processed", ...result, logs });
     }
 
     console.log("🔥 WEBHOOK RECEIVED:\n" + JSON.stringify(body, null, 2));

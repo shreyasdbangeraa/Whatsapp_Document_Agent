@@ -6,6 +6,7 @@ An AI-powered document intelligence agent built for WhatsApp using **Retrieval-A
 
 ## 🌟 Key Features
 
+- **⏰ Smart AI Reminders & Multi-Stage Deadline Countdown:** Natural language reminder scheduling (e.g., *"remind me tomorrow morning to make ML notes"*, *"on 25th september is my assignment submission deadline"*). Automatically calculates preferred time-of-day slots in IST and schedules proactive multi-stage deadline ladders (2 days before, deadline day morning/afternoon, 2 hours countdown, and deadline end) dispatched via Supabase `pg_cron` + `pg_net`.
 - **🧠 Conversational Memory (Multi-Turn Chat History):** Maintains recent conversation history in Supabase (`conversation_history`), enabling natural follow-up questions (e.g., *"Explain the second point"*, *"What was my question earlier?"*). Users can reset memory anytime with `/reset` or `/clear`.
 - **🖼️ Multimodal Vision & Document Intelligence:** Users can send photos, handwritten notes, diagrams, or PDF files directly in WhatsApp chat for instant AI analysis and extraction.
 - **📄 PDF Ingestion & Parsing:** Extracts text page-by-page using PyMuPDF (`fitz`), cleans whitespace, and splits text into overlapping chunks for context preservation.
@@ -182,7 +183,26 @@ create table if not exists conversation_history (
 
 create index if not exists idx_conv_history_phone on conversation_history(whatsapp_number, seq desc);
 
--- 6. RPC Function for Vector Similarity Search
+-- 6. Reminders & Deadline Tracking Table
+create table if not exists reminders (
+    id uuid default gen_random_uuid() primary key,
+    user_id text not null,
+    whatsapp_number text not null,
+    title text not null,
+    remind_at timestamp with time zone not null,
+    status text not null default 'pending' check (status in ('pending', 'sent', 'cancelled')),
+    reminder_type text not null default 'single' check (
+        reminder_type in ('single', 'deadline_lead', 'deadline_day_morning', 'deadline_day_afternoon', 'deadline_day_final', 'deadline_end')
+    ),
+    original_text text,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+    sent_at timestamp with time zone
+);
+
+create index if not exists idx_reminders_pending on reminders(status, remind_at asc);
+create index if not exists idx_reminders_user on reminders(whatsapp_number, status);
+
+-- 7. RPC Function for Vector Similarity Search
 create or replace function match_document_chunks (
     query_embedding vector(768),
     match_user_id text,
