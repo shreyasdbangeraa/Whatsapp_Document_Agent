@@ -120,25 +120,6 @@ def handle_incoming_message(message: dict, contacts: list):
     if not text:
         return
 
-    # Check for common greetings
-    clean_lower = text.lower().strip(" !.?")
-    if clean_lower in ["hi", "hello", "hey", "start", "help", "hola", "who are you"]:
-        greeting_reply = (
-            f"👋 Hello {contact_name}!\n\n"
-            "I am your *AI Document Agent* 📄🤖.\n\n"
-            "Ask me any question about your uploaded documents, and I'll find the answers with exact page citations.\n\n"
-            "💡 *Example questions you can try:*\n"
-            "• _What is an algorithm?_\n"
-            "• _Summarize key concepts in the document._"
-        )
-        print(f"Sending greeting reply to {sender}...", flush=True)
-        try:
-            send_text_message(to=sender, message=greeting_reply)
-            print(f"✅ Greeting reply sent to {sender}", flush=True)
-        except Exception as e:
-            print(f"❌ Failed to send greeting: {e}", flush=True)
-        return
-
     # Process question with RAG pipeline
     try:
         print(f"🔍 Searching document knowledge base for: '{text}'...", flush=True)
@@ -157,8 +138,15 @@ def handle_incoming_message(message: dict, contacts: list):
             print("ℹ️ Falling back to test_user_001 knowledge base chunks...", flush=True)
             search_results = search_documents(question=text, user_id="test_user_001", match_count=5)
 
-        print(f"📚 Retrieved {len(search_results)} relevant chunks. Generating answer with Gemini...", flush=True)
-        answer = generate_answer(question=text, search_results=search_results)
+        print(f"📚 Retrieved {len(search_results)} relevant chunks. Generating smart answer with Gemini...", flush=True)
+        answer = generate_answer(question=text, search_results=search_results, user_name=contact_name)
+
+        print(f"🤖 Generated Answer:\n{answer}\n", flush=True)
+
+        print(f"📤 Sending response back to {sender} on WhatsApp...", flush=True)
+        send_text_message(to=sender, message=answer)
+        print(f"✅ Answer successfully delivered to {sender} on WhatsApp!", flush=True)
+
 
         print(f"🤖 Generated Answer:\n{answer}\n", flush=True)
 

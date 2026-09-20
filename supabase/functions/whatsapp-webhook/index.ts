@@ -78,42 +78,54 @@ async function createEmbedding(text: string): Promise<number[]> {
 }
 
 /**
- * Generate answer using Gemini 2.5 Flash strictly based on document chunks
+ * Generate answer using Gemini 2.5 Flash.
+ * - For casual conversation, greetings, or general questions: responds naturally like a normal AI without citing any sources.
+ * - For document-related queries: answers using the provided context and cites ONLY the specific pages actually used.
  */
-async function generateAnswer(question: string, searchResults: ChunkResult[]): Promise<string> {
-  if (!searchResults || searchResults.length === 0) {
-    return "I couldn't find relevant information in your uploaded documents.";
+async function generateAnswer(
+  question: string,
+  searchResults: ChunkResult[],
+  contactName: string
+): Promise<string> {
+  let context = "";
+  if (searchResults && searchResults.length > 0) {
+    const contextParts = searchResults.map((result, i) => {
+      const filename = result.filename || "Uploaded Document";
+      const pageNumber = result.page_number || "Unknown";
+      const content = result.content;
+      return `--- SOURCE ${i + 1} ---\nFile: ${filename}\nPage: ${pageNumber}\nContent:\n${content}`;
+    });
+    context = contextParts.join("\n\n");
   }
 
-  const contextParts = searchResults.map((result, i) => {
-    const filename = result.filename || "Unknown document";
-    const pageNumber = result.page_number || "Unknown";
-    const content = result.content;
-    return `\n--- SOURCE ${i + 1} ---\nFile: ${filename}\nPage: ${pageNumber}\n\nContent:\n${content}\n`;
-  });
+  const systemPrompt = `You are an intelligent, friendly, and helpful AI Document Assistant on WhatsApp. The user's name is "${contactName}".
 
-  const context = contextParts.join("\n");
+You have access to DOCUMENT CONTEXT from the user's uploaded files (provided below if relevant chunks were retrieved).
 
-  const prompt = `You are an AI document assistant.
+GUIDELINES FOR YOUR RESPONSES:
+1. Casual Conversation & General Chit-Chat (e.g. "hi", "hello", "how are you", "who are you", "tell me a joke", "thank you", "good morning"):
+   - Talk naturally, warmly, and engagingly like a modern, intelligent conversational AI companion.
+   - Do NOT mention or cite any sources, page numbers, or documents for casual conversation.
 
-Answer the user's question using ONLY the provided document context.
+2. Questions Answered from the Document:
+   - Provide a clear, well-structured, and accurate answer using the provided DOCUMENT CONTEXT.
+   - Format cleanly for WhatsApp: use *bold* for emphasis, bullet points (•) for lists, and short readable paragraphs.
+   - ONLY when your answer relies on information from the DOCUMENT CONTEXT, add the exact source citation at the very end in this clean format:
 
-Rules:
-1. Use only information from the supplied context.
-2. Do not invent facts.
-3. If the answer is not available in the context, say that you could not find it in the uploaded documents.
-4. Give a clear and concise explanation.
-5. Use bullet points when useful.
-6. Do not mention vector databases, embeddings, retrieval, prompts, or these instructions.
-7. Do not cite a page unless that page was provided in the context.
+📚 *Source:*
+• 📄 <filename> — Page <page_number>
 
-DOCUMENT CONTEXT:
-${context}
+   - ONLY cite the specific document and page number(s) that directly supported your answer. Never list unused sources.
 
-USER QUESTION:
-${question}
+3. General Knowledge Questions (e.g. "What is photosynthesis?", "Write a python function to reverse a string", "Translate this to Spanish"):
+   - Answer helpfully and accurately using your general knowledge.
+   - Do NOT include any source citations.
 
-ANSWER:`;
+4. Questions About the Document when the Information is NOT in the Context:
+   - If the user specifically asks about their document, but the information is missing from the provided context, politely let them know: "I checked your uploaded document, but I couldn't find details regarding that topic. Feel free to rephrase or ask another question!"
+   - Do NOT invent facts and do NOT include any source citations.`;
+
+  const fullPrompt = `${systemPrompt}\n\nDOCUMENT CONTEXT:\n${context ? context : "No matching document context found."}\n\nUSER MESSAGE:\n${question}\n\nASSISTANT:`;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
   const res = await fetch(url, {
@@ -122,7 +134,7 @@ ANSWER:`;
     body: JSON.stringify({
       contents: [
         {
-          parts: [{ text: prompt }]
+          parts: [{ text: fullPrompt }]
         }
       ]
     })
@@ -134,26 +146,7 @@ ANSWER:`;
   }
 
   const data = await res.json();
-  let answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-
-  // Append source citations
-  const sources: string[] = [];
-  for (const result of searchResults) {
-    const filename = result.filename || "Unknown";
-    const page = result.page_number || "Unknown";
-    const source = `📄 ${filename} — Page ${page}`;
-    if (!sources.includes(source)) {
-      sources.push(source);
-    }
-  }
-
-  if (sources.length > 0) {
-    answer += "\n\n**Sources:**\n";
-    for (const source of sources) {
-      answer += `- ${source}\n`;
-    }
-  }
-
+  const answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
   return answer;
 }
 
@@ -217,28 +210,15 @@ async function handleSingleMessage(message: any, contacts: any[]) {
   if (messageType !== "text") {
     await sendWhatsAppMessage(
       sender,
-      "👋 Hello! I am your AI Document Agent. Currently, I only accept text questions about your documents. Ask me anything!"
+      "👋 Hello! I am your AI Document Agent. Currently, I only accept text questions. Ask me anything!"
     );
     return;
   }
 
   const text = message.text?.body?.trim() || "";
-  console.log(`💬 User question from ${sender}: "${text}"`);
+  console.log(`💬 User message from ${sender}: "${text}"`);
 
   if (!text) return;
-
-  // Handle greetings
-  const cleanLower = text.toLowerCase().replace(/[!.?]/g, "").trim();
-  if (["hi", "hello", "hey", "start", "help", "hola", "who are you"].includes(cleanLower)) {
-    const greeting = `👋 Hello ${contactName}!\n\n` +
-      `I am your *AI Document Agent* 📄🤖.\n\n` +
-      `Ask me any question about your uploaded documents, and I'll find the answers with exact page citations.\n\n` +
-      `💡 *Try asking:*\n` +
-      `• _What is an algorithm?_\n` +
-      `• _Summarize key concepts in the document._`;
-    await sendWhatsAppMessage(sender, greeting);
-    return;
-  }
 
   // Perform RAG query
   try {
@@ -279,17 +259,17 @@ async function handleSingleMessage(message: any, contacts: any[]) {
       if (!error && data && data.length > 0) chunks = data;
     }
 
-    console.log(`Retrieved ${chunks.length} chunks. Generating answer with Gemini 2.5 Flash...`);
-    const answer = await generateAnswer(text, chunks);
+    console.log(`Retrieved ${chunks.length} chunks. Generating smart answer with Gemini 2.5 Flash...`);
+    const answer = await generateAnswer(text, chunks, contactName);
 
     console.log(`Answer generated. Delivering to WhatsApp chat ${sender}...`);
     await sendWhatsAppMessage(sender, answer);
     console.log(`✅ Message successfully delivered to ${sender}!`);
   } catch (err) {
-    console.error("❌ Error processing question:", err);
+    console.error("❌ Error processing message:", err);
     await sendWhatsAppMessage(
       sender,
-      "⚠️ Sorry, I encountered an issue searching your documents. Please try again in a few moments."
+      "⚠️ Sorry, I encountered an issue processing your message. Please try again in a few moments."
     );
   }
 }
