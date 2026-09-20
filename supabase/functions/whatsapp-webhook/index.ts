@@ -383,6 +383,95 @@ GUIDELINES FOR YOUR RESPONSE:
 }
 
 /**
+ * Normalize WhatsApp audio MIME types for Gemini API
+ */
+function normalizeAudioMime(mime: string): string {
+  if (!mime) return "audio/ogg";
+  const clean = mime.split(";")[0].trim().toLowerCase();
+  if (clean.includes("ogg") || clean.includes("opus")) return "audio/ogg";
+  if (clean.includes("mp3") || clean.includes("mpeg")) return "audio/mp3";
+  if (clean.includes("wav")) return "audio/wav";
+  if (clean.includes("aac")) return "audio/aac";
+  if (clean.includes("m4a") || clean.includes("mp4")) return "audio/mp4";
+  return clean || "audio/ogg";
+}
+
+/**
+ * Transcribe WhatsApp voice notes or audio clips using Gemini Multimodal Audio
+ */
+async function transcribeAudioWithGemini(
+  base64Data: string,
+  mimeType: string,
+  contactName: string,
+  debugLog?: (s: string) => void
+): Promise<string> {
+  const candidateModels = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash"
+  ];
+
+  const normalizedMime = normalizeAudioMime(mimeType);
+  const prompt = `You are an expert multilingual speech-to-text transcription engine.
+Transcribe the spoken audio verbatim in whatever language the user spoke (English, Hindi, Hinglish, Spanish, etc.).
+GUIDELINES:
+1. Output ONLY the exact transcription of the spoken words.
+2. Do not add markdown backticks, conversational introductions, or commentary.
+3. If the audio is completely silent or unrecognizable static noise, output exactly: "[Unintelligible audio]"`;
+
+  let lastError: any = null;
+
+  for (const model of candidateModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: normalizedMime,
+                    data: base64Data
+                  }
+                },
+                { text: prompt }
+              ]
+            }
+          ]
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const transcript = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        if (transcript) {
+          console.log(`🎙️ Speech transcribed via model ${model}: "${transcript}"`);
+          debugLog?.(`🎙️ Speech transcribed via model ${model}: "${transcript}"`);
+          return transcript;
+        }
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ Model ${model} audio transcription returned ${res.status}: ${errText}`);
+        debugLog?.(`⚠️ Model ${model} audio status ${res.status}: ${errText}`);
+        lastError = new Error(`Model ${model} audio error: ${res.status}`);
+      }
+    } catch (err) {
+      console.warn(`⚠️ Model ${model} audio exception:`, err);
+      debugLog?.(`⚠️ Model ${model} audio exception: ${String(err)}`);
+      lastError = err;
+    }
+  }
+
+  if (lastError) throw lastError;
+  return "[Unintelligible audio]";
+}
+
+/**
  * Generate 768-dimensional embedding using Google Gemini API
  */
 async function createEmbedding(text: string): Promise<number[]> {
@@ -1147,7 +1236,177 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
     return;
   }
 
-  // 3. HANDLE TEXT MESSAGES
+  // 3. HANDLE AUDIO / VOICE NOTE MESSAGES
+  if (messageType === "audio" || messageType === "voice") {
+    const mediaId = message.audio?.id || message.voice?.id;
+    const audioMime = message.audio?.mime_type || message.voice?.mime_type || "audio/ogg";
+    const directBase64 = message.audio?.base64 || message.voice?.base64 || "";
+    const isVoice = message.audio?.voice === true || messageType === "voice";
+    console.log(`🎙️ Voice note/Audio received: ID=${mediaId || "direct"}, MIME=${audioMime}, isVoice=${isVoice}`);
+
+    if (!mediaId && !directBase64) {
+      await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the voice note. Please try recording again.", debugLog);
+      return;
+    }
+
+    try {
+      await sendWhatsAppMessage(sender, "🎙️ Listening to your voice note, please give me a moment...", debugLog);
+      const { base64, mimeType } = directBase64
+        ? { base64: directBase64, mimeType: audioMime }
+        : await fetchWhatsAppMediaAsBase64(mediaId);
+
+      const transcript = await transcribeAudioWithGemini(base64, mimeType, contactName, debugLog);
+
+      if (!transcript || transcript === "[Unintelligible audio]") {
+        await sendWhatsAppMessage(
+          sender,
+          "🎙️ I listened to your voice note, but I couldn't clearly hear any speech. Could you please record again in a quiet place or type your message?",
+          debugLog
+        );
+        return;
+      }
+
+      console.log(`🗣️ Transcribed text from ${sender}: "${transcript}"`);
+      debugLog?.(`🗣️ Transcribed text from ${sender}: "${transcript}"`);
+
+      const lower = transcript.toLowerCase().trim();
+
+      // A. Clear conversation memory command
+      if (lower === "/reset" || lower === "/clear" || lower === "clear memory" || lower === "reset memory") {
+        await clearConversationHistory(sender, debugLog);
+        await sendWhatsAppMessage(
+          sender,
+          `🎙️ *Voice Note:* _"${transcript}"_\n\n🧹 *Memory Cleared!*\n\nI have forgotten our previous conversation. What would you like to explore next?`,
+          debugLog
+        );
+        return;
+      }
+
+      // B. View upcoming reminders command
+      if (lower === "/reminders" || lower === "my reminders" || lower === "view reminders" || lower === "show reminders") {
+        const { data: upcoming } = await supabase
+          .from("reminders")
+          .select("*")
+          .eq("whatsapp_number", sender)
+          .eq("status", "pending")
+          .order("remind_at", { ascending: true });
+
+        if (!upcoming || upcoming.length === 0) {
+          await sendWhatsAppMessage(
+            sender,
+            `🎙️ *Voice Note:* _"${transcript}"_\n\n📋 You have no upcoming reminders scheduled right now.`,
+            debugLog
+          );
+        } else {
+          const listText = upcoming.map((r, i) => {
+            const dateStr = new Intl.DateTimeFormat("en-US", {
+              timeZone: "Asia/Kolkata",
+              dateStyle: "medium",
+              timeStyle: "short"
+            }).format(new Date(r.remind_at));
+            return `${i + 1}. 📌 *${r.title}*\n   ⏰ ${dateStr}`;
+          }).join("\n\n");
+
+          await sendWhatsAppMessage(
+            sender,
+            `🎙️ *Voice Note:* _"${transcript}"_\n\n📋 *Your Upcoming Scheduled Reminders:*\n\n${listText}`,
+            debugLog
+          );
+        }
+        return;
+      }
+
+      // C. Reminder or Deadline scheduling intent
+      try {
+        const reminderResult = await parseReminderRequest(transcript, contactName, debugLog);
+        if (
+          reminderResult &&
+          reminderResult.is_reminder &&
+          reminderResult.scheduled_reminders &&
+          reminderResult.scheduled_reminders.length > 0
+        ) {
+          console.log(`⏰ Scheduling ${reminderResult.scheduled_reminders.length} reminder(s) from voice note...`);
+          for (const item of reminderResult.scheduled_reminders) {
+            await supabase.from("reminders").insert({
+              user_id: sender,
+              whatsapp_number: sender,
+              title: item.title || reminderResult.task_title || "Voice Reminder",
+              remind_at: new Date(item.remind_at_iso).toISOString(),
+              reminder_type: item.reminder_type || "single",
+              original_text: transcript,
+              status: "pending"
+            });
+          }
+
+          const confirmMsg = reminderResult.confirmation_message || "✅ *Reminder Set Successfully!*";
+          const fullReply = `🎙️ *Voice Note:* _"${transcript}"_\n\n${confirmMsg}`;
+          await sendWhatsAppMessage(sender, fullReply, debugLog);
+          await saveConversationTurn(userDbId || sender, sender, `[Voice Note]: "${transcript}"`, fullReply, debugLog);
+          return;
+        }
+      } catch (parseErr) {
+        console.warn("⚠️ Exception parsing reminder intent from voice:", parseErr);
+      }
+
+      // D. Document RAG & Intelligent Conversation
+      const history = await getConversationHistory(sender, 10, debugLog);
+      let chunks: ChunkResult[] = [];
+      try {
+        const embedding = await createEmbedding(transcript);
+        if (embedding && embedding.length > 0) {
+          const { data: senderChunks } = await supabase.rpc("match_document_chunks", {
+            query_embedding: embedding,
+            match_user_id: sender,
+            match_count: 5
+          });
+          if (senderChunks && senderChunks.length > 0) chunks = senderChunks;
+
+          if (chunks.length === 0 && userDbId && userDbId !== sender) {
+            const { data: dbChunks } = await supabase.rpc("match_document_chunks", {
+              query_embedding: embedding,
+              match_user_id: userDbId,
+              match_count: 5
+            });
+            if (dbChunks && dbChunks.length > 0) chunks = dbChunks;
+          }
+
+          if (chunks.length > 0) {
+            const docIds = [...new Set(chunks.map(c => c.document_id).filter(Boolean))];
+            if (docIds.length > 0) {
+              const { data: docs } = await supabase.from("documents").select("id, filename").in("id", docIds);
+              if (docs && docs.length > 0) {
+                const docMap = new Map(docs.map((d: any) => [d.id, d.filename]));
+                for (const c of chunks) {
+                  if (c.document_id && docMap.has(c.document_id)) {
+                    c.filename = docMap.get(c.document_id);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (embedErr) {
+        console.warn("⚠️ Vector search failed for voice note:", embedErr);
+      }
+
+      const generatedAnswer = await generateAnswer(transcript, chunks, contactName, history, debugLog);
+      const voiceReply = `🎙️ *Voice Note:* _"${transcript}"_\n\n${generatedAnswer}`;
+      await sendWhatsAppMessage(sender, voiceReply, debugLog);
+      await saveConversationTurn(userDbId || sender, sender, `[Voice Note]: "${transcript}"`, voiceReply, debugLog);
+      return;
+    } catch (audioErr) {
+      console.error("❌ Error processing audio:", audioErr);
+      debugLog?.("❌ Error processing audio: " + String(audioErr));
+      await sendWhatsAppMessage(
+        sender,
+        "⚠️ Sorry, I encountered an issue processing your voice note. Please try recording again.",
+        debugLog
+      );
+      return;
+    }
+  }
+
+  // 4. HANDLE TEXT MESSAGES
   if (messageType === "text") {
     const text = message.text?.body?.trim() || "";
     console.log(`💬 User message from ${sender}: "${text}"`);
@@ -1330,10 +1589,10 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
     return;
   }
 
-  // 4. UNSUPPORTED TYPES
+  // 5. UNSUPPORTED TYPES
   await sendWhatsAppMessage(
     sender,
-    "👋 Hello! I currently support text questions, reminders & deadlines, images (photos, diagrams, notes), and PDF documents. Send me a file or ask any question!",
+    "👋 Hello! I support text questions, voice notes 🎙️, reminders & deadlines ⏰, images/photos 🖼️, and PDF documents 📄. Send me a voice note or ask any question!",
     debugLog
   );
 }
