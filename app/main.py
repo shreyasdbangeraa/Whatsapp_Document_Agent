@@ -1,8 +1,8 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
-from app.whatsapp import send_text_message
 
 from app.config import WHATSAPP_VERIFY_TOKEN
+from app.whatsapp import send_text_message
 
 
 app = FastAPI()
@@ -10,7 +10,6 @@ app = FastAPI()
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
-
     params = request.query_params
 
     mode = params.get("hub.mode")
@@ -21,6 +20,7 @@ async def verify_webhook(request: Request):
 
     if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
         print("Webhook verified successfully")
+
         return PlainTextResponse(
             content=challenge,
             status_code=200
@@ -63,13 +63,18 @@ async def receive_webhook(request: Request):
 
         if message_type == "text":
             text = message["text"]["body"]
+
             print("Message:", text)
 
-            send_text_message(
-    to=sender,
-    message="👋 Hello! Your AI Document Agent received your message."
-)
-            
+            # Only reply to your actual WhatsApp test recipient.
+            # This prevents replies to Meta's sample webhook sender.
+            if sender == "917019041717":
+                send_text_message(
+                    to=sender,
+                    message="👋 Hello! Your AI Document Agent received your message."
+                )
+            else:
+                print("Sample/test sender detected. Reply skipped.")
 
         print("=" * 60)
 
