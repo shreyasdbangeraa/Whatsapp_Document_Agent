@@ -19,10 +19,156 @@ interface ChunkResult {
   similarity?: number;
 }
 
+interface HistoryRow {
+  role: string;
+  content: string;
+}
+
+/**
+ * Format conversation history into valid alternating Gemini turns
+ */
+function formatHistoryForGemini(
+  history: HistoryRow[]
+): Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> {
+  const formatted: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
+  let expectedRole: "user" | "model" = "user";
+
+  for (const item of history) {
+    const role: "user" | "model" =
+      item.role === "model" || item.role === "assistant" ? "model" : "user";
+    const text = item.content?.trim();
+    if (!text) continue;
+
+    if (role === expectedRole) {
+      formatted.push({
+        role: role,
+        parts: [{ text: text }]
+      });
+      expectedRole = role === "user" ? "model" : "user";
+    } else if (formatted.length > 0) {
+      // Merge consecutive same-role messages
+      const last = formatted[formatted.length - 1];
+      last.parts[0].text += `\n\n${text}`;
+    }
+  }
+
+  // Gemini requires turns to alternate, ending with the user turn we will append.
+  // Therefore, any trailing user turns in the history must be popped.
+  while (formatted.length > 0 && formatted[formatted.length - 1].role === "user") {
+    formatted.pop();
+  }
+
+  return formatted;
+}
+
+/**
+ * Fetch recent conversation history for a given WhatsApp number
+ */
+async function getConversationHistory(
+  whatsappNumber: string,
+  limitCount = 10,
+  debugLog?: (s: string) => void
+): Promise<HistoryRow[]> {
+  try {
+    const { data, error } = await supabase
+      .from("conversation_history")
+      .select("role, content, seq")
+      .eq("whatsapp_number", whatsappNumber)
+      .order("seq", { ascending: false })
+      .limit(limitCount);
+
+    if (error) {
+      console.warn("⚠️ Error fetching conversation history:", error);
+      debugLog?.("⚠️ Error fetching conversation history: " + JSON.stringify(error));
+      return [];
+    }
+    const result = (data || []).reverse();
+    debugLog?.(`Fetched ${result.length} previous turns for ${whatsappNumber}`);
+    return result;
+  } catch (err) {
+    console.warn("⚠️ Exception fetching conversation history:", err);
+    debugLog?.("⚠️ Exception fetching conversation history: " + String(err));
+    return [];
+  }
+}
+
+/**
+ * Save user prompt and assistant reply into conversation_history
+ */
+async function saveConversationTurn(
+  userId: string,
+  whatsappNumber: string,
+  userMessage: string,
+  modelMessage: string,
+  debugLog?: (s: string) => void
+) {
+  try {
+    const uid = String(userId || whatsappNumber);
+    const num = String(whatsappNumber);
+
+    debugLog?.(`Inserting user message for ${num}...`);
+    const { error: userErr } = await supabase.from("conversation_history").insert({
+      user_id: uid,
+      whatsapp_number: num,
+      role: "user",
+      content: userMessage
+    });
+
+    if (userErr) {
+      debugLog?.("⚠️ Error saving user message: " + JSON.stringify(userErr));
+    }
+
+    debugLog?.(`Inserting model message for ${num}...`);
+    const { error: modelErr } = await supabase.from("conversation_history").insert({
+      user_id: uid,
+      whatsapp_number: num,
+      role: "model",
+      content: modelMessage
+    });
+
+    if (modelErr) {
+      debugLog?.("⚠️ Error saving model message: " + JSON.stringify(modelErr));
+    } else {
+      console.log(`💾 Saved conversation turn for ${whatsappNumber}`);
+      debugLog?.("💾 Successfully saved conversation turn.");
+    }
+  } catch (err) {
+    console.warn("⚠️ Exception saving conversation turn:", err);
+    debugLog?.("⚠️ Exception saving conversation turn: " + String(err));
+  }
+}
+
+/**
+ * Clear conversation history for a user
+ */
+async function clearConversationHistory(
+  whatsappNumber: string,
+  debugLog?: (s: string) => void
+): Promise<boolean> {
+  try {
+    const { error } = await supabase
+      .from("conversation_history")
+      .delete()
+      .eq("whatsapp_number", whatsappNumber);
+
+    if (error) {
+      console.error("⚠️ Error clearing history:", error);
+      debugLog?.("⚠️ Error clearing history: " + JSON.stringify(error));
+      return false;
+    }
+    debugLog?.("Cleared conversation history for " + whatsappNumber);
+    return true;
+  } catch (err) {
+    console.error("⚠️ Exception clearing history:", err);
+    debugLog?.("⚠️ Exception clearing history: " + String(err));
+    return false;
+  }
+}
+
 /**
  * Send a WhatsApp text message via Meta Graph API
  */
-async function sendWhatsAppMessage(to: string, message: string): Promise<boolean> {
+async function sendWhatsAppMessage(to: string, message: string, debugLog?: (s: string) => void): Promise<boolean> {
   const url = `https://graph.facebook.com/v25.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
   const payload = {
     messaging_product: "whatsapp",
@@ -32,6 +178,7 @@ async function sendWhatsAppMessage(to: string, message: string): Promise<boolean
   };
 
   console.log(`📤 Sending message to ${to}...`);
+  debugLog?.(`📤 Sending WhatsApp message to ${to}...`);
 
   try {
     const res = await fetch(url, {
@@ -45,9 +192,11 @@ async function sendWhatsAppMessage(to: string, message: string): Promise<boolean
 
     const resText = await res.text();
     console.log(`📤 Send Status: ${res.status}, Response: ${resText}`);
+    debugLog?.(`📤 Meta WhatsApp API Status: ${res.status}`);
     return res.ok;
   } catch (err) {
     console.error("❌ Exception while calling WhatsApp API:", err);
+    debugLog?.(`❌ Exception calling WhatsApp API: ${String(err)}`);
     return false;
   }
 }
@@ -102,12 +251,16 @@ async function generateMultimodalAnswer(
   base64Data: string,
   mimeType: string,
   contactName: string,
-  isDocument: boolean = false
+  isDocument: boolean = false,
+  debugLog?: (s: string) => void
 ): Promise<string> {
   const candidateModels = [
-    "gemini-flash-latest",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
+    "gemini-flash-latest",
     "gemini-2.5-flash"
   ];
 
@@ -181,15 +334,18 @@ GUIDELINES FOR YOUR RESPONSE:
         const answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
         if (answer) {
           console.log(`✅ Multimodal response generated using model: ${model}`);
+          debugLog?.(`✅ Multimodal response generated using model: ${model}`);
           return answer;
         }
       } else {
         const errText = await res.text();
         console.warn(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
+        debugLog?.(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
         lastError = new Error(`Model ${model} error: ${res.status}`);
       }
     } catch (err) {
       console.warn(`⚠️ Model ${model} multimodal exception:`, err);
+      debugLog?.(`⚠️ Model ${model} multimodal exception: ${String(err)}`);
       lastError = err;
     }
   }
@@ -224,12 +380,14 @@ async function createEmbedding(text: string): Promise<number[]> {
 }
 
 /**
- * Generate text answer using Gemini with multi-model fallback
+ * Generate text answer using Gemini with multi-turn conversation memory and multi-model fallback
  */
 async function generateAnswer(
   question: string,
   searchResults: ChunkResult[],
-  contactName: string
+  contactName: string,
+  history: HistoryRow[] = [],
+  debugLog?: (s: string) => void
 ): Promise<string> {
   let context = "";
   if (searchResults && searchResults.length > 0) {
@@ -244,15 +402,14 @@ async function generateAnswer(
 
   const systemPrompt = `You are an intelligent, friendly, and helpful AI Document Assistant on WhatsApp. The user's name is "${contactName}".
 
-You have access to DOCUMENT CONTEXT from the user's uploaded files (provided below if relevant chunks were retrieved).
-
 GUIDELINES FOR YOUR RESPONSES:
-1. Casual Conversation & General Chit-Chat (e.g. "hi", "hello", "how are you", "who are you", "tell me a joke", "thank you", "good morning"):
+1. Conversational Memory & Natural Follow-Ups:
+   - You have conversational memory of recent messages in this conversation. Use this context to answer follow-up questions naturally (e.g., if the user asks "explain that further", "what did I say earlier?", "summarize the second point", or refers to something mentioned previously).
+2. Casual Conversation & General Chit-Chat (e.g. "hi", "hello", "how are you", "who are you", "tell me a joke", "thank you", "good morning"):
    - Talk naturally, warmly, and engagingly like a modern, intelligent conversational AI companion.
    - Do NOT mention or cite any sources, page numbers, or documents for casual conversation.
-
-2. Questions Answered from the Document:
-   - Provide a clear, well-structured, and accurate answer using the provided DOCUMENT CONTEXT.
+3. Questions Answered from the Document Context:
+   - If DOCUMENT CONTEXT is provided (or was discussed in previous turns), provide a clear, well-structured, and accurate answer using that information.
    - Format cleanly for WhatsApp: use *bold* for emphasis, bullet points (•) for lists, and short readable paragraphs.
    - ONLY when your answer relies on information from the DOCUMENT CONTEXT, add the exact source citation at the very end in this clean format:
 
@@ -260,21 +417,36 @@ GUIDELINES FOR YOUR RESPONSES:
 • 📄 <filename> — Page <page_number>
 
    - ONLY cite the specific document and page number(s) that directly supported your answer. Never list unused sources.
-
-3. General Knowledge Questions (e.g. "What is photosynthesis?", "Write a python function to reverse a string", "Translate this to Spanish"):
+4. General Knowledge Questions (e.g. "What is photosynthesis?", "Write a python function to reverse a string", "Translate this to Spanish"):
    - Answer helpfully and accurately using your general knowledge.
    - Do NOT include any source citations.
-
-4. Questions About the Document when the Information is NOT in the Context:
-   - If the user specifically asks about their document, but the information is missing from the provided context, politely let them know: "I checked your uploaded document, but I couldn't find details regarding that topic. Feel free to rephrase or ask another question!"
+5. Questions About the Document when the Information is NOT in the Context:
+   - If the user specifically asks about their document, but the information is missing from the provided context and conversation, politely let them know: "I checked your uploaded document, but I couldn't find details regarding that topic. Feel free to rephrase or ask another question!"
    - Do NOT invent facts and do NOT include any source citations.`;
 
-  const fullPrompt = `${systemPrompt}\n\nDOCUMENT CONTEXT:\n${context ? context : "No matching document context found."}\n\nUSER MESSAGE:\n${question}\n\nASSISTANT:`;
+  const formattedHistory = formatHistoryForGemini(history);
+  debugLog?.(`Formatted history turns count: ${formattedHistory.length}`);
+
+  let currentTurnPrompt = question;
+  if (context && context.trim().length > 0) {
+    currentTurnPrompt = `DOCUMENT CONTEXT:\n${context}\n\nUSER QUESTION:\n${question}`;
+  }
+
+  const contents = [
+    ...formattedHistory,
+    {
+      role: "user" as const,
+      parts: [{ text: currentTurnPrompt }]
+    }
+  ];
 
   const candidateModels = [
-    "gemini-flash-latest",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
+    "gemini-flash-latest",
     "gemini-2.5-flash"
   ];
 
@@ -287,11 +459,10 @@ GUIDELINES FOR YOUR RESPONSES:
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: fullPrompt }]
-            }
-          ]
+          system_instruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          contents: contents
         })
       });
 
@@ -300,15 +471,18 @@ GUIDELINES FOR YOUR RESPONSES:
         const answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
         if (answer) {
           console.log(`✅ Generated answer using model: ${model}`);
+          debugLog?.(`✅ Generated answer using model: ${model}`);
           return answer;
         }
       } else {
         const errText = await res.text();
         console.warn(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
+        debugLog?.(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
         lastError = new Error(`Model ${model} error: ${res.status}`);
       }
     } catch (err) {
       console.warn(`⚠️ Model ${model} fetch exception:`, err);
+      debugLog?.(`⚠️ Model ${model} fetch exception: ${String(err)}`);
       lastError = err;
     }
   }
@@ -323,29 +497,34 @@ GUIDELINES FOR YOUR RESPONSES:
 /**
  * Lookup or create user in Supabase
  */
-async function getOrCreateUser(whatsappNumber: string) {
+async function getOrCreateUser(whatsappNumber: string, debugLog?: (s: string) => void) {
   try {
-    const { data: existing } = await supabase
-      .table("users")
+    const { data: existing, error: existErr } = await supabase
+      .from("users")
       .select("*")
       .eq("whatsapp_number", whatsappNumber)
       .maybeSingle();
 
+    if (existErr) {
+      debugLog?.("User lookup error: " + JSON.stringify(existErr));
+    }
     if (existing) return existing;
 
     const { data: newUser, error } = await supabase
-      .table("users")
+      .from("users")
       .insert({ whatsapp_number: whatsappNumber })
       .select()
       .single();
 
     if (error) {
       console.error("Error creating user:", error);
+      debugLog?.("Error creating user: " + JSON.stringify(error));
       return null;
     }
     return newUser;
   } catch (err) {
     console.error("Exception in getOrCreateUser:", err);
+    debugLog?.("Exception in getOrCreateUser: " + String(err));
     return null;
   }
 }
@@ -353,18 +532,20 @@ async function getOrCreateUser(whatsappNumber: string) {
 /**
  * Handle a single incoming message from WhatsApp (Text, Image, Document/PDF)
  */
-async function handleSingleMessage(message: any, contacts: any[]) {
+async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s: string) => void) {
   const sender = message.from;
   const messageType = message.type;
   const messageId = message.id;
 
   console.log(`📩 Processing message from ${sender} (type: ${messageType}, id: ${messageId})`);
+  debugLog?.(`📩 Processing message from ${sender} (type: ${messageType}, id: ${messageId})`);
 
   if (!sender) return;
 
   // Filter out Meta tester dummy senders
   if (sender === "16315551181" || sender === "1234567890" || sender.length < 8) {
     console.log(`ℹ️ Meta test sample sender (${sender}). Skipping reply.`);
+    debugLog?.("Skipped Meta dummy sender.");
     return;
   }
 
@@ -374,8 +555,9 @@ async function handleSingleMessage(message: any, contacts: any[]) {
   }
 
   // Register or lookup user in Supabase
-  const user = await getOrCreateUser(sender);
+  const user = await getOrCreateUser(sender, debugLog);
   const userDbId = user ? String(user.id) : null;
+  debugLog?.(`User DB ID: ${userDbId}`);
 
   // 1. HANDLE IMAGE MESSAGES
   if (messageType === "image") {
@@ -384,21 +566,27 @@ async function handleSingleMessage(message: any, contacts: any[]) {
     console.log(`🖼️ Image received: ID=${mediaId}, Caption="${caption}"`);
 
     if (!mediaId) {
-      await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the image data. Please try sending it again.");
+      await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the image data. Please try sending it again.", debugLog);
       return;
     }
 
     try {
-      await sendWhatsAppMessage(sender, "🔍 Analyzing your image, please give me a moment...");
+      await sendWhatsAppMessage(sender, "🔍 Analyzing your image, please give me a moment...", debugLog);
       const { base64, mimeType } = await fetchWhatsAppMediaAsBase64(mediaId);
-      const answer = await generateMultimodalAnswer(caption, base64, mimeType, contactName, false);
-      await sendWhatsAppMessage(sender, answer);
+      const answer = await generateMultimodalAnswer(caption, base64, mimeType, contactName, false, debugLog);
+      await sendWhatsAppMessage(sender, answer, debugLog);
       console.log(`✅ Image analysis sent to ${sender}`);
+
+      // Save turn to conversation history
+      const userSummary = caption ? `[Sent an image with caption: "${caption}"]` : "[Sent an image]";
+      await saveConversationTurn(userDbId || sender, sender, userSummary, answer, debugLog);
     } catch (imgErr) {
       console.error("❌ Error processing image:", imgErr);
+      debugLog?.("❌ Error processing image: " + String(imgErr));
       await sendWhatsAppMessage(
         sender,
-        "⚠️ Sorry, I encountered an issue analyzing your image. Please try again with a clear photo."
+        "⚠️ Sorry, I encountered an issue analyzing your image. Please try again with a clear photo.",
+        debugLog
       );
     }
     return;
@@ -413,17 +601,17 @@ async function handleSingleMessage(message: any, contacts: any[]) {
     console.log(`📄 Document received: ${filename} (ID=${mediaId}, MIME=${docMime}, Caption="${caption}")`);
 
     if (!mediaId) {
-      await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the document. Please try sending it again.");
+      await sendWhatsAppMessage(sender, "⚠️ Sorry, I could not read the document. Please try sending it again.", debugLog);
       return;
     }
 
     try {
-      await sendWhatsAppMessage(sender, `📄 Processing *${filename}* with AI, please wait a moment...`);
+      await sendWhatsAppMessage(sender, `📄 Processing *${filename}* with AI, please wait a moment...`, debugLog);
       const { base64, mimeType } = await fetchWhatsAppMediaAsBase64(mediaId);
 
       // Save document record in Supabase
       try {
-        await supabase.table("documents").insert({
+        await supabase.from("documents").insert({
           user_id: userDbId || sender,
           filename: filename
         });
@@ -431,14 +619,22 @@ async function handleSingleMessage(message: any, contacts: any[]) {
         console.warn("Could not save document record:", dbErr);
       }
 
-      const answer = await generateMultimodalAnswer(caption, base64, mimeType, contactName, true);
-      await sendWhatsAppMessage(sender, answer);
+      const answer = await generateMultimodalAnswer(caption, base64, mimeType, contactName, true, debugLog);
+      await sendWhatsAppMessage(sender, answer, debugLog);
       console.log(`✅ Document analysis sent to ${sender}`);
+
+      // Save turn to conversation history
+      const userSummary = caption
+        ? `[Uploaded document: ${filename} with question: "${caption}"]`
+        : `[Uploaded document: ${filename}]`;
+      await saveConversationTurn(userDbId || sender, sender, userSummary, answer, debugLog);
     } catch (docErr) {
       console.error("❌ Error processing document:", docErr);
+      debugLog?.("❌ Error processing document: " + String(docErr));
       await sendWhatsAppMessage(
         sender,
-        "⚠️ Sorry, I encountered an issue processing your document. Please verify the file and try again."
+        "⚠️ Sorry, I encountered an issue processing your document. Please verify the file and try again.",
+        debugLog
       );
     }
     return;
@@ -448,10 +644,29 @@ async function handleSingleMessage(message: any, contacts: any[]) {
   if (messageType === "text") {
     const text = message.text?.body?.trim() || "";
     console.log(`💬 User message from ${sender}: "${text}"`);
+    debugLog?.(`💬 User message from ${sender}: "${text}"`);
 
     if (!text) return;
 
+    // Reset / clear conversation memory command
+    const lower = text.toLowerCase();
+    if (lower === "/reset" || lower === "/clear" || lower === "clear memory" || lower === "reset memory") {
+      console.log(`🧹 Clearing conversation history for ${sender}...`);
+      await clearConversationHistory(sender, debugLog);
+      await sendWhatsAppMessage(
+        sender,
+        "🧹 *Memory Cleared!*\n\nI have forgotten our previous conversation. What would you like to explore next?",
+        debugLog
+      );
+      return;
+    }
+
     try {
+      // 1. Fetch recent conversation history
+      const history = await getConversationHistory(sender, 10, debugLog);
+      console.log(`🧠 Loaded ${history.length} previous conversation messages for ${sender}`);
+
+      // 2. Perform vector search for relevant document chunks
       let chunks: ChunkResult[] = [];
       try {
         console.log(`🔍 Generating embedding for: "${text}"...`);
@@ -482,19 +697,25 @@ async function handleSingleMessage(message: any, contacts: any[]) {
         }
       } catch (embedErr) {
         console.warn("⚠️ Warning: vector search failed, falling back to general answer:", embedErr);
+        debugLog?.("⚠️ Vector search failed: " + String(embedErr));
       }
 
       console.log(`Retrieved ${chunks.length} chunks. Generating smart answer with Gemini...`);
-      const answer = await generateAnswer(text, chunks, contactName);
+      const answer = await generateAnswer(text, chunks, contactName, history, debugLog);
 
       console.log(`Answer generated. Delivering to WhatsApp chat ${sender}...`);
-      await sendWhatsAppMessage(sender, answer);
+      await sendWhatsAppMessage(sender, answer, debugLog);
       console.log(`✅ Message successfully delivered to ${sender}!`);
+
+      // 3. Save turn to conversation history
+      await saveConversationTurn(userDbId || sender, sender, text, answer, debugLog);
     } catch (err) {
       console.error("❌ Error processing message:", err);
+      debugLog?.("❌ Error processing message: " + String(err));
       await sendWhatsAppMessage(
         sender,
-        "⚠️ Sorry, I encountered an issue processing your message. Please try again in a few moments."
+        "⚠️ Sorry, I encountered an issue processing your message. Please try again in a few moments.",
+        debugLog
       );
     }
     return;
@@ -503,7 +724,8 @@ async function handleSingleMessage(message: any, contacts: any[]) {
   // 4. UNSUPPORTED TYPES
   await sendWhatsAppMessage(
     sender,
-    "👋 Hello! I currently support text questions, images (photos, diagrams, notes), and PDF documents. Send me a file or ask any question!"
+    "👋 Hello! I currently support text questions, images (photos, diagrams, notes), and PDF documents. Send me a file or ask any question!",
+    debugLog
   );
 }
 
@@ -543,6 +765,10 @@ Deno.serve(async (req: Request) => {
     }
 
     console.log("🔥 WEBHOOK RECEIVED:\n" + JSON.stringify(body, null, 2));
+    const logs: string[] = [];
+    const debugLog = (msg: string) => {
+      logs.push(`[${new Date().toISOString()}] ${msg}`);
+    };
 
     const processEvents = async () => {
       try {
@@ -564,19 +790,20 @@ Deno.serve(async (req: Request) => {
             if (val.messages && val.messages.length > 0) {
               const contacts = val.contacts || [];
               for (const msg of val.messages) {
-                await handleSingleMessage(msg, contacts);
+                await handleSingleMessage(msg, contacts, debugLog);
               }
             }
           }
         }
       } catch (err) {
         console.error("❌ Error in processEvents:", err);
+        debugLog("❌ Top-level error: " + String(err));
       }
     };
 
     await processEvents();
 
-    return Response.json({ status: "received" });
+    return Response.json({ status: "received", logs });
   }
 
   return new Response("Method not allowed", { status: 405 });

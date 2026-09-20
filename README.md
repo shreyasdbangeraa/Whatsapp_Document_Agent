@@ -6,10 +6,12 @@ An AI-powered document intelligence agent built for WhatsApp using **Retrieval-A
 
 ## 🌟 Key Features
 
+- **🧠 Conversational Memory (Multi-Turn Chat History):** Maintains recent conversation history in Supabase (`conversation_history`), enabling natural follow-up questions (e.g., *"Explain the second point"*, *"What was my question earlier?"*). Users can reset memory anytime with `/reset` or `/clear`.
+- **🖼️ Multimodal Vision & Document Intelligence:** Users can send photos, handwritten notes, diagrams, or PDF files directly in WhatsApp chat for instant AI analysis and extraction.
 - **📄 PDF Ingestion & Parsing:** Extracts text page-by-page using PyMuPDF (`fitz`), cleans whitespace, and splits text into overlapping chunks for context preservation.
 - **🧠 Vector Embeddings:** Computes 768-dimensional embeddings using Google Gemini's `gemini-embedding-001` with batch processing support.
 - **⚡ Vector Storage & Similarity Search:** Stores document metadata and vector embeddings in Supabase using PostgreSQL and `pgvector` with cosine similarity search (`match_document_chunks` RPC).
-- **🎯 Grounded RAG Generation:** Answers user questions strictly using retrieved document context with **Gemini 2.5 Flash** (`gemini-2.5-flash`), eliminating hallucinations and providing transparent source citations (file name & page numbers).
+- **🎯 Grounded RAG Generation:** Answers user questions strictly using retrieved document context with transparent source citations (file name & page numbers) only when citing documents, and converses naturally for casual chat without citations.
 - **👤 Multi-User Management:** Tracks users by WhatsApp phone number for isolated and secure multi-tenant document queries.
 
 ---
@@ -167,7 +169,20 @@ create table if not exists document_chunks (
     created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
--- 5. RPC Function for Vector Similarity Search
+-- 5. Conversational Memory Table (Multi-Turn Chat History)
+create table if not exists conversation_history (
+    id uuid default gen_random_uuid() primary key,
+    seq bigserial,
+    user_id text not null,
+    whatsapp_number text not null,
+    role text not null check (role in ('user', 'model', 'assistant')),
+    content text not null,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+create index if not exists idx_conv_history_phone on conversation_history(whatsapp_number, seq desc);
+
+-- 6. RPC Function for Vector Similarity Search
 create or replace function match_document_chunks (
     query_embedding vector(768),
     match_user_id text,
