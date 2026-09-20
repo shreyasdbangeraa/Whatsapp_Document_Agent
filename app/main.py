@@ -35,13 +35,38 @@ async def verify_webhook(request: Request):
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-
     data = await request.json()
 
-    print("\n" + "=" * 60)
-    print("WHATSAPP WEBHOOK RECEIVED")
-    print("=" * 60)
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
 
-    print(data)
+        messages = value.get("messages", [])
+
+        if not messages:
+            print("No message found in webhook")
+            return {"status": "ignored"}
+
+        message = messages[0]
+
+        sender = message.get("from")
+        message_id = message.get("id")
+        message_type = message.get("type")
+
+        print("\n" + "=" * 60)
+        print("WHATSAPP MESSAGE RECEIVED")
+        print("=" * 60)
+
+        print("Sender:", sender)
+        print("Message ID:", message_id)
+        print("Message Type:", message_type)
+
+        if message_type == "text":
+            text = message["text"]["body"]
+            print("Message:", text)
+
+        print("=" * 60)
+
+    except Exception as e:
+        print("Error processing webhook:", e)
 
     return {"status": "received"}
