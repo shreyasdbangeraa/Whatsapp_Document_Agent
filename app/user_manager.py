@@ -1,4 +1,4 @@
-from database import supabase
+from app.database import supabase
 
 
 def get_or_create_user(whatsapp_number: str):

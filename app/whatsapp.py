@@ -1,6 +1,6 @@
 import httpx
 
-from config import (
+from app.config import (
     WHATSAPP_ACCESS_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID
 )

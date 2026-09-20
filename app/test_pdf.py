@@ -1,4 +1,4 @@
-from pdf_processor import (
+from app.pdf_processor import (
     extract_text_from_pdf,
     clean_text,
     create_chunks

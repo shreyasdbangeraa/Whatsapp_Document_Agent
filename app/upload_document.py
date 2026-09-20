@@ -1,12 +1,12 @@
-from pdf_processor import (
+from app.pdf_processor import (
     extract_pdf_chunks,
     clean_text,
     create_chunks
 )
 
-from embeddings import create_embeddings
+from app.embeddings import create_embeddings
 
-from database import supabase
+from app.database import supabase
 
 
 PDF_PATH = "test.pdf"

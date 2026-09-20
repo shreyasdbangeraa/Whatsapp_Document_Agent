@@ -1,5 +1,5 @@
-from retriever import search_documents
-from generator import generate_answer
+from app.retriever import search_documents
+from app.generator import generate_answer
 
 
 USER_ID = "test_user_001"

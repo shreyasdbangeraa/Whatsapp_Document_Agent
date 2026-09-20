@@ -1,4 +1,4 @@
-from retriever import search_documents
+from app.retriever import search_documents
 
 
 USER_ID = "test_user_001"

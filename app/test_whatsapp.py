@@ -1,4 +1,4 @@
-from whatsapp import send_text_message
+from app.whatsapp import send_text_message
 
 
 MY_WHATSAPP_NUMBER = "917019041717"

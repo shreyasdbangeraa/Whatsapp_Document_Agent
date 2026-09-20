@@ -1,5 +1,5 @@
-from embeddings import create_embedding
-from database import supabase
+from app.embeddings import create_embedding
+from app.database import supabase
 
 
 def search_documents(

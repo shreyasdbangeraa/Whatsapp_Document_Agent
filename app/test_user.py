@@ -1,4 +1,4 @@
-from user_manager import get_or_create_user
+from app.user_manager import get_or_create_user
 
 
 phone_number = "+919876543210"

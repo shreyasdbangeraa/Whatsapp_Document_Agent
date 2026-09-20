@@ -1,4 +1,4 @@
-from embeddings import create_embedding
+from app.embeddings import create_embedding
 
 
 text = """
