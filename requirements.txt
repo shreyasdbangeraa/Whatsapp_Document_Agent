@@ -4,3 +4,4 @@ pymupdf
 supabase
 python-dotenv
 google-genai
+httpx
