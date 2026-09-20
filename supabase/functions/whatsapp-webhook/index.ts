@@ -744,7 +744,9 @@ GUIDELINES FOR YOUR RESPONSES:
 2. Casual Conversation & General Chit-Chat (e.g. "hi", "hello", "how are you", "who are you", "tell me a joke", "thank you", "good morning"):
    - Talk naturally, warmly, and engagingly like a modern, intelligent conversational AI companion.
    - Do NOT mention or cite any sources, page numbers, or documents for casual conversation.
-3. Questions Answered from the Document Context:
+3. Real-Time Web Search & Live Facts:
+   - For questions about current events, today's news, live sports scores, weather, stock or crypto prices, use the Google Search tool to provide accurate, up-to-the-minute real-time facts with clean WhatsApp formatting.
+4. Questions Answered from the Document Context:
    - If DOCUMENT CONTEXT is provided (or was discussed in previous turns), provide a clear, well-structured, and accurate answer using that information.
    - Format cleanly for WhatsApp: use *bold* for emphasis, bullet points (•) for lists, and short readable paragraphs.
    - ONLY when your answer relies on information from the DOCUMENT CONTEXT, add the exact source citation at the very end in this clean format:
@@ -753,10 +755,9 @@ GUIDELINES FOR YOUR RESPONSES:
 • 📄 <filename> — Page <page_number>
 
    - ONLY cite the specific document and page number(s) that directly supported your answer. Never list unused sources.
-4. General Knowledge Questions (e.g. "What is photosynthesis?", "Write a python function to reverse a string", "Translate this to Spanish"):
-   - Answer helpfully and accurately using your general knowledge.
-   - Do NOT include any source citations.
-5. Questions About the Document when the Information is NOT in the Context:
+5. General Knowledge & Conceptual Inquiries:
+   - Answer helpfully and accurately using your broad intelligence and knowledge.
+6. Questions About the Document when the Information is NOT in the Context:
    - If the user specifically asks about their document, but the information is missing from the provided context and conversation, politely let them know: "I checked your uploaded document, but I couldn't find details regarding that topic. Feel free to rephrase or ask another question!"
    - Do NOT invent facts and do NOT include any source citations.`;
 
@@ -791,26 +792,70 @@ GUIDELINES FOR YOUR RESPONSES:
   for (const model of candidateModels) {
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const useWebSearch = !context || context.trim().length === 0;
+
+      const requestBody: any = {
+        system_instruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents: contents
+      };
+
+      if (useWebSearch) {
+        requestBody.tools = [{ google_search: {} }];
+      }
+
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: systemPrompt }]
-          },
-          contents: contents
-        })
+        body: JSON.stringify(requestBody)
       });
 
       if (res.ok) {
         const data = await res.json();
-        const answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        let answer = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
         if (answer) {
-          console.log(`✅ Generated answer using model: ${model}`);
-          debugLog?.(`✅ Generated answer using model: ${model}`);
+          // Extract Google Search grounding citations if present
+          const groundingChunks = data.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+          if (groundingChunks && groundingChunks.length > 0) {
+            const sources: string[] = [];
+            const seenUrls = new Set<string>();
+            for (const chunk of groundingChunks) {
+              const web = chunk.web;
+              if (web && web.uri && !seenUrls.has(web.uri)) {
+                seenUrls.add(web.uri);
+                const title = web.title ? web.title.trim() : "Web Source";
+                sources.push(`• *${title}*: ${web.uri}`);
+                if (sources.length >= 3) break;
+              }
+            }
+            if (sources.length > 0 && !answer.includes(sources[0].slice(0, 20))) {
+              answer += `\n\n🌐 *Live Web Sources:*\n${sources.join("\n")}`;
+            }
+          }
+
+          console.log(`✅ Generated answer using model: ${model} (searchGrounded=${useWebSearch})`);
+          debugLog?.(`✅ Generated answer using model: ${model} (searchGrounded=${useWebSearch})`);
           return answer;
         }
       } else {
+        // Fallback retry without tools if model returned 400
+        if (useWebSearch && (res.status === 400 || res.status === 404)) {
+          delete requestBody.tools;
+          const retryRes = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody)
+          });
+          if (retryRes.ok) {
+            const retryData = await retryRes.json();
+            const retryAnswer = retryData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+            if (retryAnswer) {
+              console.log(`✅ Generated answer using model: ${model} (fallback without search tool)`);
+              return retryAnswer;
+            }
+          }
+        }
         const errText = await res.text();
         console.warn(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
         debugLog?.(`⚠️ Model ${model} returned ${res.status}: ${errText}`);
@@ -828,6 +873,187 @@ GUIDELINES FOR YOUR RESPONSES:
   }
 
   return "I'm having trouble processing that right now. Please try again in a moment!";
+}
+
+/**
+ * Detect first URL in text
+ */
+function extractFirstUrl(text: string): string | null {
+  const match = text.match(/(https?:\/\/[^\s]+)/i);
+  return match ? match[0].trim() : null;
+}
+
+/**
+ * Fetch and summarize an article or YouTube video, and save to bookmarks
+ */
+async function fetchAndSummarizeUrl(
+  url: string,
+  sender: string,
+  contactName: string,
+  userDbId?: string | null,
+  debugLog?: (s: string) => void
+): Promise<string> {
+  console.log(`🔗 Processing URL: ${url} for ${sender}`);
+  debugLog?.(`🔗 Processing URL: ${url}`);
+
+  const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
+  let contentToSummarize = "";
+  let extractedTitle = "";
+  let domain = "";
+
+  try {
+    const parsedUrl = new URL(url);
+    domain = parsedUrl.hostname.replace(/^www\./, "");
+  } catch (_) {
+    domain = "web";
+  }
+
+  if (isYouTube) {
+    debugLog?.("Detected YouTube URL. Querying oEmbed metadata...");
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+      const oembedRes = await fetch(oembedUrl);
+      if (oembedRes.ok) {
+        const oembedData = await oembedRes.json();
+        extractedTitle = oembedData.title || "YouTube Video";
+        contentToSummarize = `YouTube Video Title: ${extractedTitle}\nChannel/Author: ${oembedData.author_name || "Unknown"}\nURL: ${url}`;
+      }
+    } catch (ytErr) {
+      console.warn("YouTube oEmbed fetch error:", ytErr);
+    }
+    if (!extractedTitle) {
+      extractedTitle = "YouTube Video";
+      contentToSummarize = `YouTube Video URL: ${url}`;
+    }
+  } else {
+    debugLog?.("Fetching web article content...");
+    try {
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      });
+
+      if (res.ok) {
+        const html = await res.text();
+
+        // Extract title
+        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        if (titleMatch) {
+          extractedTitle = titleMatch[1].trim().replace(/\s+/g, " ");
+        }
+
+        // Clean HTML: remove script, style, comments, and tags
+        const text = html
+          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&nbsp;/g, " ")
+          .replace(/&amp;/g, "&")
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        contentToSummarize = text.slice(0, 6000);
+      }
+    } catch (fetchErr) {
+      console.warn("Error fetching article:", fetchErr);
+      debugLog?.("Error fetching article: " + String(fetchErr));
+    }
+  }
+
+  // Use Gemini to generate a high-quality 3-bullet TL;DR summary
+  const summaryPrompt = `You are an elite reading assistant and web summarizer on WhatsApp. The user's name is "${contactName}".
+Analyze the following content from: ${url}
+
+METADATA:
+Title: ${extractedTitle || "Article / Video"}
+Source: ${domain}
+Content:
+${contentToSummarize || `URL: ${url}`}
+
+GUIDELINES:
+1. Provide a crisp 1-sentence overview.
+2. Provide exactly 3 to 4 impactful bullet points (•) summarizing key insights, facts, or takeaways.
+3. Keep it punchy, engaging, and easy to read on WhatsApp with clean markdown (*bold*, • bullets).
+4. If it's a YouTube video, summarize what the video is about and why it matters.
+
+FORMAT:
+• *Overview:* <1 sentence overview>
+• *Key Takeaways:*
+  • <Bullet 1>
+  • <Bullet 2>
+  • <Bullet 3>`;
+
+  let summaryText = "";
+  const candidateModels = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash"
+  ];
+
+  for (const model of candidateModels) {
+    try {
+      const gUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const gRes = await fetch(gUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: summaryPrompt }] }],
+          tools: [{ google_search: {} }]
+        })
+      });
+
+      if (gRes.ok) {
+        const data = await gRes.json();
+        const textOut = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        if (textOut) {
+          summaryText = textOut;
+          break;
+        }
+      }
+    } catch (err) {
+      console.warn(`Summary error with model ${model}:`, err);
+    }
+  }
+
+  if (!summaryText) {
+    summaryText = `• *Overview:* Shared link from ${domain}.\n• *Key Takeaways:*\n  • Content saved to read-later bookmarks.`;
+  }
+
+  // Save to bookmarks table in Supabase
+  try {
+    await supabase.from("bookmarks").insert({
+      user_id: sender,
+      whatsapp_number: sender,
+      url: url,
+      title: extractedTitle || domain,
+      summary: summaryText,
+      category: isYouTube ? "youtube" : "article"
+    });
+    console.log(`💾 Saved bookmark for ${sender}: ${url}`);
+    debugLog?.(`Saved bookmark to Supabase for ${url}`);
+  } catch (bmErr) {
+    console.warn("Could not save to bookmarks table:", bmErr);
+    debugLog?.("Could not save to bookmarks table: " + String(bmErr));
+  }
+
+  const finalMessage = `🔗 *Link Summarized & Saved to Read-Later!*
+
+📌 *Title:* ${extractedTitle || domain}
+🌐 *Source:* ${domain}
+🔗 *Link:* ${url}
+
+${summaryText}
+
+💾 _Saved to your read-later bookmarks! Send */bookmarks* anytime to view your saved list._`;
+
+  return finalMessage;
 }
 
 /**
@@ -1316,6 +1542,36 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
         return;
       }
 
+      // B2. View bookmarks command via voice
+      if (lower.includes("my bookmarks") || lower.includes("show bookmarks") || lower.includes("view bookmarks") || lower.includes("reading list")) {
+        const { data: savedList } = await supabase
+          .from("bookmarks")
+          .select("*")
+          .eq("whatsapp_number", sender)
+          .order("created_at", { ascending: false })
+          .limit(10);
+
+        if (!savedList || savedList.length === 0) {
+          await sendWhatsAppMessage(
+            sender,
+            `🎙️ *Voice Note:* _"${transcript}"_\n\n📚 *Your Reading List is Empty!*\nSend any article link or YouTube URL to save it to your bookmarks.`,
+            debugLog
+          );
+        } else {
+          const listText = savedList.map((b: any, i: number) => {
+            const icon = b.category === "youtube" ? "▶️" : "📰";
+            return `${i + 1}. ${icon} *${b.title}*\n   🌐 ${b.url}`;
+          }).join("\n\n");
+
+          await sendWhatsAppMessage(
+            sender,
+            `🎙️ *Voice Note:* _"${transcript}"_\n\n📚 *Your Saved Read-Later Bookmarks:*\n\n${listText}`,
+            debugLog
+          );
+        }
+        return;
+      }
+
       // C. Reminder or Deadline scheduling intent
       try {
         const reminderResult = await parseReminderRequest(transcript, contactName, debugLog);
@@ -1480,6 +1736,73 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
       return;
     }
 
+    // D. View saved bookmarks command
+    if (lower === "/bookmarks" || lower === "my bookmarks" || lower === "view bookmarks" || lower === "show bookmarks" || lower === "reading list") {
+      console.log(`📚 Fetching saved bookmarks for ${sender}...`);
+      const { data: savedList, error: bmErr } = await supabase
+        .from("bookmarks")
+        .select("*")
+        .eq("whatsapp_number", sender)
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      if (bmErr || !savedList || savedList.length === 0) {
+        await sendWhatsAppMessage(
+          sender,
+          "📚 *Your Reading List is Empty!*\n\nWhenever you find an interesting article, blog, or YouTube video, simply send the link here! I'll summarize it and save it to your bookmarks.",
+          debugLog
+        );
+      } else {
+        const listText = savedList.map((b: any, i: number) => {
+          const dateStr = new Intl.DateTimeFormat("en-US", {
+            timeZone: "Asia/Kolkata",
+            dateStyle: "medium"
+          }).format(new Date(b.created_at));
+          const icon = b.category === "youtube" ? "▶️" : "📰";
+          return `${i + 1}. ${icon} *${b.title}*\n   🌐 ${b.url}\n   📅 Saved: ${dateStr}`;
+        }).join("\n\n");
+
+        await sendWhatsAppMessage(
+          sender,
+          `📚 *Your Saved Read-Later Bookmarks:*\n\n${listText}\n\n💡 _Send /clearbookmarks to clear your saved reading list._`,
+          debugLog
+        );
+      }
+      return;
+    }
+
+    // E. Clear saved bookmarks command
+    if (lower === "/clearbookmarks" || lower === "clear bookmarks") {
+      console.log(`🧹 Clearing saved bookmarks for ${sender}...`);
+      await supabase
+        .from("bookmarks")
+        .delete()
+        .eq("whatsapp_number", sender);
+
+      await sendWhatsAppMessage(
+        sender,
+        "🧹 *All saved bookmarks cleared!* Your read-later list has been reset.",
+        debugLog
+      );
+      return;
+    }
+
+    // F. Check for Web Link / YouTube URL to summarize and bookmark
+    const detectedUrl = extractFirstUrl(text);
+    if (detectedUrl) {
+      console.log(`🔗 Found URL in message from ${sender}: ${detectedUrl}`);
+      try {
+        await sendWhatsAppMessage(sender, "🔍 Analyzing link and generating 3-bullet summary, please wait a moment...", debugLog);
+        const summaryMsg = await fetchAndSummarizeUrl(detectedUrl, sender, contactName, userDbId, debugLog);
+        await sendWhatsAppMessage(sender, summaryMsg, debugLog);
+        await saveConversationTurn(userDbId || sender, sender, text, summaryMsg, debugLog);
+        return;
+      } catch (linkErr) {
+        console.warn("⚠️ Exception in URL summarizer:", linkErr);
+        debugLog?.("⚠️ Exception in URL summarizer: " + String(linkErr));
+      }
+    }
+
     // D. Check for Reminder or Deadline scheduling request
     try {
       const reminderResult = await parseReminderRequest(text, contactName, debugLog);
@@ -1592,7 +1915,7 @@ async function handleSingleMessage(message: any, contacts: any[], debugLog?: (s:
   // 5. UNSUPPORTED TYPES
   await sendWhatsAppMessage(
     sender,
-    "👋 Hello! I support text questions, voice notes 🎙️, reminders & deadlines ⏰, images/photos 🖼️, and PDF documents 📄. Send me a voice note or ask any question!",
+    "👋 Hello! I support text questions, voice notes 🎙️, live Google search 🌐, web/YouTube summarizer 🔗, reminders & deadlines ⏰, images 🖼️, and PDF documents 📄. How can I help you today?",
     debugLog
   );
 }
